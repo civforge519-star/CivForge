@@ -1,0 +1,19 @@
+name = "civforge-worker"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[vars]
+ADMIN_TOKEN = "change_me"
+WORLD_SIZE = "128"
+NPC_COUNT = "50"
+TICK_RATE = "1"
+
+[durable_objects]
+bindings = [
+  { name = "WORLD_DO", class_name = "WorldDurableObject" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorldDurableObject"]
+

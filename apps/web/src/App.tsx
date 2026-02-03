@@ -40,8 +40,8 @@ const App = () => {
   const [events, setEvents] = useState<string[]>([]);
   const [speed, setSpeed] = useState(1);
 
-  const httpUrl = import.meta.env.VITE_WORKER_HTTP_URL ?? "http://127.0.0.1:8787";
-  const wsUrl = import.meta.env.VITE_WORKER_WS_URL ?? "ws://127.0.0.1:8787/ws";
+  const httpUrl = import.meta.env.VITE_HTTP_URL ?? "http://127.0.0.1:8787";
+  const wsUrl = import.meta.env.VITE_WS_URL ?? "ws://127.0.0.1:8787/ws";
   const adminToken = import.meta.env.VITE_ADMIN_TOKEN ?? "";
 
   const aliveCount = useMemo(
