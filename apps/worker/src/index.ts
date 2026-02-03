@@ -10,7 +10,9 @@ type Env = {
   TICK_RATE?: string;
 };
 
-type WsMessage = { type: "init" | "tick"; data: any };
+type WsMessage =
+  | { type: "snapshot"; tick: number; size: number; tiles: WorldState["tiles"]; npcs: WorldState["npcs"]; homes: WorldState["homes"]; villages: WorldState["villages"]; events: string[]; paused: boolean; tickRate: number }
+  | { type: "tick"; tick: number; npcs: WorldState["npcs"]; homes: WorldState["homes"]; villages: WorldState["villages"]; events: string[] };
 
 const WORLD_ID = "primary";
 const STORAGE_KEY = "world_state";
@@ -73,14 +75,23 @@ export class WorldDurableObject {
     const url = new URL(request.url);
     const pathname = url.pathname;
 
-    if (pathname === "/health") {
-      return new Response(JSON.stringify({ status: "ok" }), {
-        headers: { "content-type": "application/json" }
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET,POST,OPTIONS",
+          "access-control-allow-headers": "content-type,x-admin-token"
+        }
       });
     }
 
+    if (pathname === "/health") {
+      return this.jsonResponse({ ok: true });
+    }
+
     if (pathname === "/world/snapshot") {
-      return Response.json(this.world);
+      return this.jsonResponse(this.world);
     }
 
     if (pathname === "/ws") {
@@ -89,42 +100,42 @@ export class WorldDurableObject {
 
     if (pathname === "/admin/pause" && request.method === "POST") {
       if (!this.authorize(request)) {
-        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+        return this.jsonResponse({ error: "unauthorized" }, 401);
       }
       if (this.world) {
         this.world.paused = true;
         await this.persistWorld();
       }
-      return Response.json({ status: "paused" });
+      return this.jsonResponse({ status: "paused" });
     }
 
     if (pathname === "/admin/resume" && request.method === "POST") {
       if (!this.authorize(request)) {
-        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+        return this.jsonResponse({ error: "unauthorized" }, 401);
       }
       if (this.world) {
         this.world.paused = false;
         await this.persistWorld();
         await this.scheduleNextTick();
       }
-      return Response.json({ status: "running" });
+      return this.jsonResponse({ status: "running" });
     }
 
     if (pathname === "/admin/speed" && request.method === "POST") {
       if (!this.authorize(request)) {
-        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+        return this.jsonResponse({ error: "unauthorized" }, 401);
       }
       const body = (await request.json().catch(() => ({}))) as { rate?: number };
       const nextRate = Number(body?.rate);
       if (!Number.isFinite(nextRate) || nextRate <= 0 || nextRate > 10) {
-        return new Response(JSON.stringify({ error: "rate must be between 0 and 10" }), { status: 400 });
+        return this.jsonResponse({ error: "rate must be between 0 and 10" }, 400);
       }
       if (this.world) {
         this.world.tickRate = nextRate;
         await this.persistWorld();
         await this.scheduleNextTick();
       }
-      return Response.json({ status: "ok", tickRate: this.world?.tickRate ?? nextRate });
+      return this.jsonResponse({ status: "ok", tickRate: this.world?.tickRate ?? nextRate });
     }
 
     return new Response("Not found", { status: 404 });
@@ -142,15 +153,11 @@ export class WorldDurableObject {
       }
       this.broadcast({
         type: "tick",
-        data: {
-          tick: this.world.tick,
-          npcs: this.world.npcs,
-          homes: this.world.homes,
-          villages: this.world.villages,
-          events: this.world.events,
-          paused: this.world.paused,
-          tickRate: this.world.tickRate
-        }
+        tick: this.world.tick,
+        npcs: this.world.npcs,
+        homes: this.world.homes,
+        villages: this.world.villages,
+        events: this.world.events
       });
     }
     await this.scheduleNextTick();
@@ -168,21 +175,19 @@ export class WorldDurableObject {
     });
 
     if (this.world) {
-      const initMessage: WsMessage = {
-        type: "init",
-        data: {
-          size: this.world.size,
-          tiles: this.world.tiles,
-          tick: this.world.tick,
-          tickRate: this.world.tickRate,
-          npcs: this.world.npcs,
-          homes: this.world.homes,
-          villages: this.world.villages,
-          events: this.world.events,
-          paused: this.world.paused
-        }
+      const snapshotMessage: WsMessage = {
+        type: "snapshot",
+        size: this.world.size,
+        tiles: this.world.tiles,
+        tick: this.world.tick,
+        tickRate: this.world.tickRate,
+        npcs: this.world.npcs,
+        homes: this.world.homes,
+        villages: this.world.villages,
+        events: this.world.events,
+        paused: this.world.paused
       };
-      server.send(JSON.stringify(initMessage));
+      server.send(JSON.stringify(snapshotMessage));
     }
 
     return new Response(null, {
@@ -221,6 +226,18 @@ export class WorldDurableObject {
         socket.send(payload);
       }
     }
+  }
+
+  private jsonResponse(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: {
+        "content-type": "application/json",
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET,POST,OPTIONS",
+        "access-control-allow-headers": "content-type,x-admin-token"
+      }
+    });
   }
 }
 

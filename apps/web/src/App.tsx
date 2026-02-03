@@ -26,6 +26,16 @@ type WorldPayload = {
   tickRate?: number;
 };
 
+type SnapshotMessage = WorldPayload & { type: "snapshot" };
+type TickMessage = {
+  type: "tick";
+  tick: number;
+  npcs: NPC[];
+  homes: Home[];
+  villages: Village[];
+  events: string[];
+};
+
 const tileColors: Record<TileType, string> = {
   grass: "#2d9c5b",
   forest: "#1e6b3a",
@@ -40,19 +50,32 @@ const App = () => {
   const [events, setEvents] = useState<string[]>([]);
   const [speed, setSpeed] = useState(1);
 
-  const httpUrl = import.meta.env.VITE_HTTP_URL ?? "http://127.0.0.1:8787";
-  const wsUrl = import.meta.env.VITE_WS_URL ?? "ws://127.0.0.1:8787/ws";
+  const HTTP_BASE = (import.meta.env.VITE_HTTP_URL ?? "http://127.0.0.1:8787").replace(/\/+$/, "");
+  const WS_URL_RAW = import.meta.env.VITE_WS_URL ?? "ws://127.0.0.1:8787/ws";
+  const buildId = import.meta.env.VITE_BUILD_ID ?? "dev";
+  const reconnectAttempts = useRef(0);
+
+  const resolvedWsUrl = useMemo(() => {
+    let url = WS_URL_RAW.trim();
+    if (url.startsWith("http://")) {
+      url = url.replace("http://", "ws://");
+    }
+    if (url.startsWith("https://")) {
+      url = url.replace("https://", "wss://");
+    }
+    if (typeof window !== "undefined" && window.location.protocol === "https:" && url.startsWith("ws://")) {
+      url = url.replace("ws://", "wss://");
+    }
+    return url;
+  }, [WS_URL_RAW]);
   const adminToken = import.meta.env.VITE_ADMIN_TOKEN ?? "";
 
-  const aliveCount = useMemo(
-    () => (world ? world.npcs.filter((npc) => npc.alive).length : 0),
-    [world]
-  );
+  const aliveCount = useMemo(() => (world ? world.npcs.length : 0), [world]);
   const villagesCount = useMemo(() => (world ? world.villages.length : 0), [world]);
 
   const fetchSnapshot = useCallback(async () => {
     try {
-      const response = await fetch(`${httpUrl}/world/snapshot`);
+      const response = await fetch(`${HTTP_BASE}/world/snapshot`);
       if (!response.ok) {
         return;
       }
@@ -65,25 +88,28 @@ const App = () => {
     } catch (error) {
       console.error("Failed to fetch snapshot", error);
     }
-  }, [httpUrl]);
+  }, [HTTP_BASE]);
 
   const connectWs = useCallback(() => {
-    const socket = new WebSocket(wsUrl);
+    const socket = new WebSocket(resolvedWsUrl);
     let reconnectTimer: number | null = null;
 
-    socket.onopen = () => setConnected(true);
+    socket.onopen = () => {
+      reconnectAttempts.current = 0;
+      setConnected(true);
+    };
     socket.onmessage = (event) => {
       try {
-        const message = JSON.parse(event.data) as { type: string; data: any };
-        if (message.type === "init") {
-          setWorld(message.data);
-          setEvents(message.data.events ?? []);
-          setSpeed(message.data.tickRate ?? 1);
+        const message = JSON.parse(event.data) as SnapshotMessage | TickMessage;
+        if (message.type === "snapshot") {
+          setWorld(message);
+          setEvents(message.events ?? []);
+          setSpeed(message.tickRate ?? 1);
           return;
         }
         if (message.type === "tick") {
-          setWorld((prev) => (prev ? { ...prev, ...message.data } : message.data));
-          setEvents(message.data.events ?? []);
+          setWorld((prev) => (prev ? { ...prev, ...message } : prev));
+          setEvents(message.events ?? []);
         }
       } catch (error) {
         console.error("WS message error", error);
@@ -94,7 +120,10 @@ const App = () => {
       if (reconnectTimer) {
         window.clearTimeout(reconnectTimer);
       }
-      reconnectTimer = window.setTimeout(connectWs, 1500);
+      const attempt = Math.min(reconnectAttempts.current + 1, 6);
+      reconnectAttempts.current = attempt;
+      const delay = Math.min(1000 * 2 ** attempt, 15000);
+      reconnectTimer = window.setTimeout(connectWs, delay);
     };
     socket.onerror = () => socket.close();
 
@@ -104,16 +133,17 @@ const App = () => {
       }
       socket.close();
     };
-  }, [wsUrl]);
+  }, [resolvedWsUrl]);
 
   useEffect(() => {
     fetchSnapshot();
   }, [fetchSnapshot]);
 
   useEffect(() => {
+    console.log("CivForge URLs", { HTTP_BASE, WS: resolvedWsUrl, buildId });
     const cleanup = connectWs();
     return () => cleanup();
-  }, [connectWs]);
+  }, [connectWs, HTTP_BASE, resolvedWsUrl, buildId]);
 
   useEffect(() => {
     if (!world || !canvasRef.current) {
@@ -174,7 +204,7 @@ const App = () => {
 
   const callAdmin = async (path: string, body?: Record<string, number>) => {
     try {
-      await fetch(`${httpUrl}${path}`, {
+      await fetch(`${HTTP_BASE}${path}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -234,6 +264,10 @@ const App = () => {
             {events.map((event, index) => (
               <span key={`${event}-${index}`}>{event}</span>
             ))}
+          </div>
+          <div className="stat">
+            <span>Build</span>
+            <span>{buildId}</span>
           </div>
         </section>
       </div>
