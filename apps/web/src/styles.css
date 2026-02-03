@@ -1,0 +1,109 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f1115;
+  --panel: #1c1f26;
+  --text: #f5f7fb;
+  --muted: #9aa4b2;
+  --accent: #4ea1ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Inter", system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+main {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 16px;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 16px;
+}
+
+canvas {
+  width: 100%;
+  height: 70vh;
+  background: #11141a;
+  border-radius: 12px;
+  border: 1px solid #2b3140;
+}
+
+.panel {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 70vh;
+}
+
+.panel h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.stat {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+button {
+  background: #273043;
+  border: 1px solid #364057;
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.events {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  max-height: 280px;
+  overflow: auto;
+}
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  canvas {
+    height: 50vh;
+  }
+
+  .panel {
+    min-height: auto;
+  }
+}
+
