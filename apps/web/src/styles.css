@@ -40,6 +40,14 @@ canvas {
   border: 1px solid #2b3140;
 }
 
+input {
+  background: #10141c;
+  border: 1px solid #2b3140;
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
 .panel {
   background: var(--panel);
   border-radius: 12px;

@@ -1,89 +1,94 @@
-import type { Home, Job, NPC, TileType, Village, WorldState } from "./types";
+import type { Inventory, Position, WorldConfig, WorldState } from "./types";
+import { generateWorldMap, generateRegions } from "./worldgen";
 
-const JOBS: Job[] = ["farmer", "woodcutter", "builder", "guard"];
-
-const TILE_WEIGHTS: Array<{ type: TileType; weight: number }> = [
-  { type: "grass", weight: 0.45 },
-  { type: "forest", weight: 0.25 },
-  { type: "water", weight: 0.2 },
-  { type: "mountain", weight: 0.1 }
-];
-
-export const createWorld = (size: number, npcCount: number, tickRate: number): WorldState => {
-  const tiles = createTiles(size);
-  const npcs = createNPCs(size, npcCount);
-  return {
-    tick: 0,
-    size,
-    tiles,
-    npcs,
-    homes: [],
-    villages: [],
-    events: [],
-    paused: false,
-    tickRate
-  };
-};
-
-const createTiles = (size: number): TileType[][] => {
-  const tiles: TileType[][] = [];
-  for (let y = 0; y < size; y += 1) {
-    const row: TileType[] = [];
-    for (let x = 0; x < size; x += 1) {
-      row.push(weightedTile());
-    }
-    tiles.push(row);
-  }
-  return tiles;
-};
-
-const weightedTile = (): TileType => {
-  const roll = Math.random();
-  let cumulative = 0;
-  for (const item of TILE_WEIGHTS) {
-    cumulative += item.weight;
-    if (roll <= cumulative) {
-      return item.type;
-    }
-  }
-  return "grass";
-};
-
-const createNPCs = (size: number, npcCount: number): NPC[] => {
-  const npcs: NPC[] = [];
-  for (let i = 0; i < npcCount; i += 1) {
-    npcs.push({
-      id: crypto.randomUUID(),
-      hp: 100,
-      hunger: Math.floor(Math.random() * 50),
-      position: {
-        x: Math.floor(Math.random() * size),
-        y: Math.floor(Math.random() * size)
-      },
-      inventory: { food: 2, wood: 0 },
-      job: JOBS[i % JOBS.length],
-      alive: true
-    });
-  }
-  return npcs;
-};
-
-export const createHome = (ownerId: string, x: number, y: number): Home => ({
-  id: crypto.randomUUID(),
-  ownerId,
-  position: { x, y }
+const defaultInventory = (): Inventory => ({
+  food: 0,
+  wood: 0,
+  stone: 0,
+  iron: 0,
+  tools: 0,
+  weapons: 0,
+  gold: 0
 });
 
-export const createVillage = (centerX: number, centerY: number, homeIds: string[]): Village => {
-  const name = `Village-${Math.floor(Math.random() * 9999)}`;
+export const createWorld = (
+  worldId: string,
+  seed: string,
+  size: number,
+  tickRate: number,
+  type: "public" | "sandbox" = "public",
+  overrides: Partial<WorldConfig> = {}
+): WorldState => {
+  const config: WorldConfig = {
+    seed,
+    size,
+    tickRate,
+    visionRadius: 6,
+    fogOfWar: true,
+    towerBonus: 2,
+    forestPenalty: 1,
+    mountainBlocks: true,
+    maxAgents: 200,
+    maxUnitsPerAgent: 6,
+    actionsPerTick: 2,
+    actionsPerMinute: 30,
+    sandbox: type === "sandbox",
+    allowRoles: ["citizen", "tribe", "state"]
+  };
+  const mergedConfig = { ...config, ...overrides };
+
+  const tiles = generateWorldMap(mergedConfig.seed, mergedConfig.size);
+  const regions = generateRegions(tiles, mergedConfig.size);
+
   return {
-    id: crypto.randomUUID(),
-    name,
-    createdAt: new Date().toISOString(),
-    center: { x: centerX, y: centerY },
-    storage: { food: 20, wood: 10 },
-    taxRate: 0.05,
-    homeIds
+    worldId,
+    tick: 0,
+    type,
+    config: mergedConfig,
+    tiles,
+    chunkOwnership: {},
+    regions,
+    agents: {},
+    units: {},
+    cities: {},
+    states: {},
+    treaties: [],
+    armies: {},
+    markets: {},
+    actionQueues: {},
+    fog: {},
+    heatmaps: {},
+    agentLogs: {},
+    lastEventsHash: [],
+    events: [],
+    snapshots: [],
+    diagnostics: { lastTickMs: 0, avgTickMs: 0, lastPayloadBytes: 0 },
+    lastGoodSnapshotTick: 0,
+    paused: false,
+    lastTickTime: Date.now(),
+    // Drama system
+    dramaEvents: [],
+    agentStories: {},
+    wars: {},
+    cityCooldowns: {},
+    coordinationLogs: []
   };
 };
+
+export const createInventory = (seeded = false): Inventory => {
+  if (seeded) {
+    return { food: 5, wood: 5, stone: 0, iron: 0, tools: 0, weapons: 0, gold: 10 };
+  }
+  return defaultInventory();
+};
+
+export const clampPosition = (pos: Position, size: number): Position => ({
+  x: Math.max(0, Math.min(size - 1, pos.x)),
+  y: Math.max(0, Math.min(size - 1, pos.y))
+});
+
+
+
+
+
 
