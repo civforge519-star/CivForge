@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { buildHttpBase, buildWsUrl, safeParseJson } from "./net";
-import { createCamera, screenToWorld, updateCamera, worldToScreen, clamp } from "./camera";
-import { drawBorders, drawFog, drawOverlay, getChunkCanvas } from "./renderer";
+import { createCamera, screenToWorld, updateCamera, worldToScreen, clamp, resetToFit } from "./camera";
+import { drawBorders, drawFog, drawOverlay, getChunkCanvas, drawCheckerboard } from "./renderer";
 
 type Biome =
   | "ocean"
@@ -217,6 +217,10 @@ const App = () => {
   const pinchState = useRef<{ distance: number; zoom: number } | null>(null);
   const needsRender = useRef(true);
   const lastPong = useRef(Date.now());
+  const canvasSize = useRef({ width: 0, height: 0 });
+  const lastRenderError = useRef<string | null>(null);
+  const lastSnapshotTime = useRef<number | null>(null);
+  const hasFittedCamera = useRef(false);
   const lastTickRef = useRef(0);
 
   const resolvedWsUrl = useMemo(() => buildWsUrl(WS_URL_RAW), [WS_URL_RAW]);
@@ -559,25 +563,59 @@ const App = () => {
       return;
     }
     chunkCache.current.clear();
-    camera.current.x = world.config.size / 2;
-    camera.current.y = world.config.size / 2;
+    
+    // Auto-fit camera on first world load
+    if (!hasFittedCamera.current && canvasSize.current.width > 0 && canvasSize.current.height > 0) {
+      resetToFit(camera.current, world.config.size, canvasSize.current.width, canvasSize.current.height);
+      hasFittedCamera.current = true;
+    } else {
+      camera.current.x = world.config.size / 2;
+      camera.current.y = world.config.size / 2;
+    }
+    
     renderMinimap(world);
     needsRender.current = true;
+    lastSnapshotTime.current = Date.now();
   }, [world?.worldId]);
+
+  // ResizeObserver for canvas sizing
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        if (width > 0 && height > 0) {
+          canvasSize.current = { width, height };
+          needsRender.current = true;
+        }
+      }
+    });
+    
+    resizeObserver.observe(canvas);
+    return () => resizeObserver.disconnect();
+  }, []);
 
   useEffect(() => {
     let animationFrame: number;
     let lastFrame = 0;
     const renderLoop = () => {
-      const now = performance.now();
-      const cap = quality === "low" ? 20 : quality === "medium" ? 40 : camera.current.zoom < 0.6 ? 30 : 60;
-      const cam = camera.current;
-      const moving = Math.abs(cam.vx) > 0.01 || Math.abs(cam.vy) > 0.01;
-      if ((needsRender.current || moving) && now - lastFrame >= 1000 / cap) {
-        drawWorld();
-        needsRender.current = false;
-        lastFrame = now;
+      try {
+        const now = performance.now();
+        const cap = quality === "low" ? 20 : quality === "medium" ? 40 : camera.current.zoom < 0.6 ? 30 : 60;
+        const cam = camera.current;
+        const moving = Math.abs(cam.vx) > 0.01 || Math.abs(cam.vy) > 0.01;
+        if ((needsRender.current || moving) && now - lastFrame >= 1000 / cap) {
+          drawWorld();
+          needsRender.current = false;
+          lastFrame = now;
+        }
+      } catch (error) {
+        console.error("Render loop error:", error);
+        lastRenderError.current = String(error);
       }
+      // Always continue the loop, never stop
       animationFrame = requestAnimationFrame(renderLoop);
     };
     animationFrame = requestAnimationFrame(renderLoop);
@@ -718,20 +756,82 @@ const App = () => {
   };
 
   const drawWorld = () => {
-    if (!world || !canvasRef.current) {
-      return;
-    }
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      return;
-    }
-    const rect = canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.scale(dpr, dpr);
+    try {
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        return;
+      }
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        return;
+      }
+      
+      // Update canvas size from stored size (set by ResizeObserver)
+      const dpr = window.devicePixelRatio || 1;
+      const width = canvasSize.current.width || canvas.getBoundingClientRect().width;
+      const height = canvasSize.current.height || canvas.getBoundingClientRect().height;
+      
+      if (width <= 0 || height <= 0) {
+        // Schedule retry if size is invalid
+        setTimeout(() => needsRender.current = true, 100);
+        return;
+      }
+      
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+      canvas.style.width = width + "px";
+      canvas.style.height = height + "px";
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      
+      // Clear with visible background
+      ctx.fillStyle = "#0b0f14";
+      ctx.fillRect(0, 0, width, height);
+      
+      // Draw checkerboard fallback if no world or tiles missing
+      const hasTiles = world && world.tiles && world.tiles.length > 0;
+      if (!world || !hasTiles) {
+        drawCheckerboard(ctx, width, height, 32);
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "16px Inter";
+        ctx.textAlign = "center";
+        ctx.fillText(world ? "Waiting for tiles..." : "Waiting for world...", width / 2, height / 2);
+        
+        // Still draw agents as dots if we have world but no tiles
+        if (world && world.units) {
+          const worldSize = world.config?.size || 128;
+          const normalizedSize = Math.min(width, height) * 0.8;
+          const scale = normalizedSize / worldSize;
+          const offsetX = (width - normalizedSize) / 2;
+          const offsetY = (height - normalizedSize) / 2;
+          
+          for (const unit of Object.values(world.units)) {
+            const x = offsetX + unit.position.x * scale;
+            const y = offsetY + unit.position.y * scale;
+            ctx.fillStyle = "#ffffff";
+            ctx.beginPath();
+            ctx.arc(x, y, 3, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+        
+        // Update debug
+        if (typeof window !== "undefined") {
+          (window as any).__CIVFORGE_DEBUG__ = {
+            world: world ? { worldId: world.worldId, tick: world.tick } : null,
+            tilesCount: hasTiles ? world.tiles.length : 0,
+            agentsCount: world ? Object.keys(world.units).length : 0,
+            camera: { x: camera.current.x, y: camera.current.y, zoom: camera.current.zoom },
+            zoom: camera.current.zoom,
+            lastSnapshot: lastSnapshotTime.current,
+            lastRenderError: lastRenderError.current,
+            canvasSize: { width, height },
+            dpr
+          };
+        }
+        
+        lastRenderError.current = null;
+        return;
+      }
 
     // Follow agent mode
     let followPos: Position | undefined = undefined;
@@ -761,11 +861,11 @@ const App = () => {
       }
     }
     
-    updateCamera(camera.current, world.config.size, rect.width, rect.height, followPos);
+    updateCamera(camera.current, world.config.size, width, height, followPos);
 
     const cam = camera.current;
-    const halfW = rect.width / (2 * cam.zoom);
-    const halfH = rect.height / (2 * cam.zoom);
+    const halfW = width / (2 * cam.zoom);
+    const halfH = height / (2 * cam.zoom);
     const view = {
       left: Math.max(0, cam.x - halfW),
       top: Math.max(0, cam.y - halfH),
@@ -795,9 +895,6 @@ const App = () => {
     const startChunkY = Math.floor(view.top / CHUNK_SIZE);
     const endChunkX = Math.floor(view.right / CHUNK_SIZE);
     const endChunkY = Math.floor(view.bottom / CHUNK_SIZE);
-
-    ctx.fillStyle = "#0b0f14";
-    ctx.fillRect(0, 0, rect.width, rect.height);
 
     for (let cy = startChunkY; cy <= endChunkY; cy += 1) {
       for (let cx = startChunkX; cx <= endChunkX; cx += 1) {
@@ -837,7 +934,7 @@ const App = () => {
       for (const event of recentEvents.slice(0, 20)) {
         if (!event.location) continue;
         const pos = worldToScreen(event.location, view, cam.zoom);
-        if (pos.x < -20 || pos.x > rect.width + 20 || pos.y < -20 || pos.y > rect.height + 20) continue;
+        if (pos.x < -20 || pos.x > width + 20 || pos.y < -20 || pos.y > height + 20) continue;
         
         // Draw event pulse effect
         const age = world.tick - event.tick;
@@ -934,6 +1031,50 @@ const App = () => {
         ctx.setLineDash([]);
       }
     }
+    
+    // Update debug object
+    if (typeof window !== "undefined") {
+      (window as any).__CIVFORGE_DEBUG__ = {
+        world: { worldId: world.worldId, tick: world.tick, size: world.config.size },
+        tilesCount: world.tiles?.length || 0,
+        agentsCount: Object.keys(world.units || {}).length,
+        camera: { x: cam.x, y: cam.y, zoom: cam.zoom },
+        zoom: cam.zoom,
+        lastSnapshot: lastSnapshotTime.current,
+        lastRenderError: lastRenderError.current,
+        canvasSize: { width, height },
+        dpr
+      };
+    }
+    
+    lastRenderError.current = null;
+    } catch (error) {
+      console.error("Render error:", error);
+      lastRenderError.current = String(error);
+      
+      // Still try to show something
+      const canvas = canvasRef.current;
+      if (canvas) {
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          const width = canvasSize.current.width || 800;
+          const height = canvasSize.current.height || 600;
+          drawCheckerboard(ctx, width, height, 32);
+          ctx.fillStyle = "#ff5d5d";
+          ctx.font = "14px Inter";
+          ctx.textAlign = "center";
+          ctx.fillText("Render Error: " + String(error).substring(0, 50), width / 2, height / 2);
+        }
+      }
+      
+      // Update debug with error
+      if (typeof window !== "undefined") {
+        (window as any).__CIVFORGE_DEBUG__ = {
+          ...((window as any).__CIVFORGE_DEBUG__ || {}),
+          lastRenderError: String(error)
+        };
+      }
+    }
   };
 
   const handleCanvasPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -994,13 +1135,24 @@ const App = () => {
     }
   };
 
-  const handleWheel = (event: React.WheelEvent<HTMLCanvasElement>) => {
+  const handleWheel = useCallback((event: WheelEvent) => {
     event.preventDefault();
     const cam = camera.current;
     const delta = -event.deltaY * 0.001;
     cam.zoom = clamp(cam.zoom + delta, 0.3, 4);
     needsRender.current = true;
-  };
+  }, []);
+
+  // Native wheel event listener with passive: false for preventDefault
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    
+    canvas.addEventListener("wheel", handleWheel, { passive: false });
+    return () => {
+      canvas.removeEventListener("wheel", handleWheel);
+    };
+  }, [handleWheel]);
 
   const handleMinimapClick = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (!world || !minimapRef.current) {
@@ -1070,7 +1222,6 @@ const App = () => {
             onPointerMove={handleCanvasPointerMove}
             onPointerUp={handleCanvasPointerUp}
             onPointerLeave={handleCanvasPointerUp}
-            onWheel={handleWheel}
           />
           <canvas
             ref={minimapRef}
@@ -1089,7 +1240,29 @@ const App = () => {
           <div className="controls">
             <button onClick={() => fetchSnapshot()}>Refresh View</button>
             <button onClick={() => fetchWorlds()}>Refresh Lobby</button>
+            {world && canvasSize.current.width > 0 && (
+              <button onClick={() => {
+                resetToFit(camera.current, world.config.size, canvasSize.current.width, canvasSize.current.height);
+                needsRender.current = true;
+              }}>Reset View</button>
+            )}
           </div>
+          
+          <details style={{ marginTop: 12 }}>
+            <summary style={{ cursor: "pointer", color: "var(--muted)", fontSize: "0.9rem" }}>RENDER DEBUG</summary>
+            <div style={{ marginTop: 8, fontSize: "0.85rem", color: "var(--muted)", fontFamily: "monospace" }}>
+              <div>Canvas: {canvasSize.current.width}×{canvasSize.current.height}</div>
+              <div>DPR: {window.devicePixelRatio || 1}</div>
+              <div>World Size: {world?.config?.size || "N/A"}</div>
+              <div>Tiles: {world?.tiles?.length || 0} {world?.tiles?.length ? "✓" : "✗"}</div>
+              <div>Agents: {world ? Object.keys(world.units || {}).length : 0} {world && Object.keys(world.units || {}).length > 0 ? "✓" : "✗"}</div>
+              <div>Last Snapshot: {lastSnapshotTime.current ? new Date(lastSnapshotTime.current).toLocaleTimeString() : "Never"}</div>
+              <div>Camera: x={camera.current.x.toFixed(1)} y={camera.current.y.toFixed(1)} zoom={camera.current.zoom.toFixed(2)}</div>
+              {lastRenderError.current && (
+                <div style={{ color: "#ff5d5d", marginTop: 4 }}>Error: {lastRenderError.current.substring(0, 60)}</div>
+              )}
+            </div>
+          </details>
           <div className="stat">
             <span>Mode</span>
             <span style={{ color: "var(--accent)" }}>Spectator (Read-Only)</span>

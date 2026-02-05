@@ -177,3 +177,19 @@ export const drawOverlay = (
   }
 };
 
+export const drawCheckerboard = (
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  tileSize: number = 32
+): void => {
+  const cols = Math.ceil(width / tileSize);
+  const rows = Math.ceil(height / tileSize);
+  for (let y = 0; y < rows; y += 1) {
+    for (let x = 0; x < cols; x += 1) {
+      ctx.fillStyle = (x + y) % 2 === 0 ? "#1a1f26" : "#0f1419";
+      ctx.fillRect(x * tileSize, y * tileSize, tileSize, tileSize);
+    }
+  }
+};
+

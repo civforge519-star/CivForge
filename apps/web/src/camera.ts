@@ -65,3 +65,24 @@ export const screenToWorld = (
 
 export const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
+export const resetToFit = (
+  camera: CameraState,
+  worldSize: number,
+  canvasWidth: number,
+  canvasHeight: number
+): void => {
+  // Center camera on world
+  camera.x = worldSize / 2;
+  camera.y = worldSize / 2;
+  
+  // Calculate zoom to fit entire world in view
+  const padding = 0.9; // 90% of viewport
+  const zoomX = (canvasWidth * padding) / worldSize;
+  const zoomY = (canvasHeight * padding) / worldSize;
+  camera.zoom = Math.min(zoomX, zoomY, 1.2); // Cap at 1.2x
+  
+  // Reset velocity
+  camera.vx = 0;
+  camera.vy = 0;
+};
+

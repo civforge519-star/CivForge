@@ -353,6 +353,7 @@ Common errors to watch for:
 - **No updates:** ensure worker is deployed and `/health` returns `{ok:true}`.
 - **SQL errors:** run `/debug/selftest` to check database health.
 - **Worker crashes:** check Wrangler tail for uncaught exceptions.
+- **Blank canvas:** Check RENDER DEBUG panel - canvas size must be > 0 and tilesCount > 0. If tiles are missing, you'll see a checkerboard with "Waiting for tiles..." message. Use "Reset View" button to refit camera.
 
 ## Examples
 - `examples/node-agent.js`
