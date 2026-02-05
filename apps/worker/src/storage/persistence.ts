@@ -100,8 +100,12 @@ const hasTiles = async (storage: StorageState, seed: string): Promise<boolean> =
   }
 };
 
-const saveTiles = async (storage: StorageState, seed: string, tiles: WorldState["tiles"]): Promise<void> => {
+export const saveTiles = async (storage: StorageState, seed: string, tiles: WorldState["tiles"]): Promise<void> => {
   try {
+    if (!tiles || tiles.length === 0) {
+      console.warn("saveTiles: Attempted to save empty tiles array");
+      return;
+    }
     exec(storage.sql, "INSERT OR REPLACE INTO world_tiles (seed, data) VALUES (?, ?)", seed, JSON.stringify(tiles));
   } catch (error) {
     console.error("saveTiles error:", error);
@@ -109,13 +113,17 @@ const saveTiles = async (storage: StorageState, seed: string, tiles: WorldState[
   }
 };
 
-const loadTiles = async (storage: StorageState, seed: string): Promise<WorldState["tiles"] | null> => {
+export const loadTiles = async (storage: StorageState, seed: string): Promise<WorldState["tiles"] | null> => {
   try {
     const row = one<{ data: string }>(storage.sql, "SELECT data FROM world_tiles WHERE seed = ?", seed);
     if (!row?.data) {
       return null;
     }
-    return JSON.parse(row.data) as WorldState["tiles"];
+    const parsed = JSON.parse(row.data) as WorldState["tiles"];
+    if (!parsed || parsed.length === 0) {
+      return null;
+    }
+    return parsed;
   } catch (error) {
     console.error("loadTiles error:", error);
     return null;

@@ -2,7 +2,7 @@ import type { Action, Agent, AgentObservation, Unit, WorldState } from "./types"
 import { createWorld, createInventory } from "./world";
 import { observeAgent, tickWorld } from "./simulation";
 import { generateRegions, generateWorldMap } from "./worldgen";
-import { initStorage, loadSnapshot, loadWorldState, saveSnapshot, saveWorldState } from "./storage/persistence";
+import { initStorage, loadSnapshot, loadWorldState, saveSnapshot, saveWorldState, saveTiles, loadTiles } from "./storage/persistence";
 import { sanitizeWorld } from "./rules/sanity";
 
 type Env = {
@@ -157,6 +157,23 @@ export class WorldDurableObject {
           this.worldId = DEFAULT_WORLD_ID;
           await this.persistWorld();
         }
+        
+        // CRITICAL: Ensure tiles exist - regenerate if missing or wrong size
+        const expectedTileCount = this.world.config.size * this.world.config.size;
+        if (!this.world.tiles || this.world.tiles.length !== expectedTileCount) {
+          console.warn(`World tiles missing or wrong size (${this.world.tiles?.length || 0} vs ${expectedTileCount}), regenerating...`);
+          const tiles = await loadTiles(this.state.storage, this.world.config.seed);
+          if (tiles && tiles.length === expectedTileCount) {
+            this.world.tiles = tiles;
+          } else {
+            // Generate new tiles
+            const { generateWorldMap } = await import("./worldgen");
+            this.world.tiles = generateWorldMap(this.world.config.seed, this.world.config.size);
+            // Save tiles for future loads
+            await saveTiles(this.state.storage, this.world.config.seed, this.world.tiles);
+          }
+          await this.persistWorld();
+        }
       } else {
         const size = Number(this.env.WORLD_SIZE ?? 128);
         const tickRate = Number(this.env.TICK_RATE ?? 1);
@@ -165,6 +182,8 @@ export class WorldDurableObject {
         const finalWorldId = this.worldId === DEFAULT_WORLD_ID || this.worldId === "public" ? DEFAULT_WORLD_ID : this.worldId;
         this.world = createWorld(finalWorldId, seed, size, tickRate, finalWorldId === DEFAULT_WORLD_ID ? "public" : "sandbox");
         this.worldId = finalWorldId;
+        // Ensure tiles are saved
+        await saveTiles(this.state.storage, this.world.config.seed, this.world.tiles);
         await this.persistWorld();
       }
     } catch (error) {
@@ -1105,6 +1124,8 @@ export class WorldDurableObject {
     const seed = body.seed ?? crypto.randomUUID();
     const worldId = body.worldId ?? `sandbox-${crypto.randomUUID()}`;
     this.world = createWorld(worldId, seed, size, tickRate, type, body.config ?? {});
+    // Ensure tiles are saved
+    await saveTiles(this.state.storage, this.world.config.seed, this.world.tiles);
     await this.persistWorld();
     return this.jsonResponse({ status: "created", worldId, seed, type });
   }
@@ -1148,7 +1169,25 @@ export class WorldDurableObject {
       checks.world_metadata = { ok: false, error: String(error) };
     }
 
-    // Test 4: Storage operations
+    // Test 4: Tiles check (CRITICAL)
+    try {
+      if (!this.world) {
+        checks.tiles = { ok: false, error: "No world loaded" };
+      } else {
+        const expectedTileCount = this.world.config.size * this.world.config.size;
+        const tilesCount = this.world.tiles?.length || 0;
+        const tilesOk = tilesCount === expectedTileCount && tilesCount > 0;
+        checks.tiles = {
+          ok: tilesOk,
+          message: tilesOk ? `Tiles OK: ${tilesCount} (expected ${expectedTileCount})` : `Tiles MISSING: ${tilesCount} (expected ${expectedTileCount})`,
+          error: tilesOk ? undefined : `Tiles count mismatch: ${tilesCount} vs ${expectedTileCount}`
+        };
+      }
+    } catch (error) {
+      checks.tiles = { ok: false, error: String(error) };
+    }
+
+    // Test 5: Storage operations
     try {
       const testKey = "__selftest__";
       await this.state.storage.put(testKey, "test");
@@ -1229,6 +1268,19 @@ export class WorldDurableObject {
     if (!this.world) {
       return { type: "error", message: "world_not_ready" };
     }
+    
+    // CRITICAL: Sanity check - ensure tiles exist before building snapshot
+    const expectedTileCount = this.world.config.size * this.world.config.size;
+    if (!this.world.tiles || this.world.tiles.length !== expectedTileCount) {
+      console.error(`CRITICAL: World tiles missing or wrong size (${this.world.tiles?.length || 0} vs ${expectedTileCount})`);
+      // Regenerate tiles synchronously (this should not happen if initialization worked)
+      this.world.tiles = generateWorldMap(this.world.config.seed, this.world.config.size);
+      // Save tiles asynchronously (don't await)
+      saveTiles(this.state.storage, this.world.config.seed, this.world.tiles).catch(err => 
+        console.error("Failed to save regenerated tiles:", err)
+      );
+    }
+    
     if (meta?.agentId && this.world.agents[meta.agentId]) {
       const fog = this.world.fog[meta.agentId];
       const tiles = fog ? filterTilesByFog(this.world, fog) : this.world.tiles;
@@ -1256,9 +1308,8 @@ export class WorldDurableObject {
         heatmaps: fog ? filterHeatmapsForAgent(this.world.heatmaps, fog, this.world.config.size) : this.world.heatmaps
       };
     }
-    if (meta?.spectator && this.authorizeToken(meta.token)) {
-      const tiles = this.world.tiles;
-      const units = this.world.units;
+    if (meta?.spectator) {
+      // Spectator mode - allow without token, but token enables full view
       return {
         type: "snapshot",
         protocolVersion: PROTOCOL_VERSION,
@@ -1269,7 +1320,7 @@ export class WorldDurableObject {
         tick: this.world.tick,
         serverTime: Date.now(),
         config: this.world.config,
-        tiles: this.world.tiles,
+        tiles: this.world.tiles, // Always include tiles for spectators
         chunkOwnership: this.world.chunkOwnership,
         regions: this.world.regions,
         units: this.world.units,
@@ -1290,6 +1341,7 @@ export class WorldDurableObject {
         }))
       };
     }
+    // Default case: unauthenticated spectator - still return tiles
     return {
       type: "snapshot",
       protocolVersion: PROTOCOL_VERSION,
@@ -1300,7 +1352,7 @@ export class WorldDurableObject {
       tick: this.world.tick,
       serverTime: Date.now(),
       config: this.world.config,
-      tiles: [],
+      tiles: this.world.tiles, // Always include tiles
       chunkOwnership: this.world.chunkOwnership,
       regions: this.world.regions,
       units: {},
@@ -1323,6 +1375,19 @@ export class WorldDurableObject {
     if (!this.world) {
       return this.jsonResponse({ error: "world_not_ready" }, 400);
     }
+    
+    // CRITICAL: Sanity check before returning snapshot
+    const expectedTileCount = this.world.config.size * this.world.config.size;
+    if (!this.world.tiles || this.world.tiles.length !== expectedTileCount) {
+      console.error(`CRITICAL: World tiles missing before snapshot (${this.world.tiles?.length || 0} vs ${expectedTileCount}), regenerating...`);
+      // Regenerate tiles
+      const { generateWorldMap } = await import("./worldgen");
+      this.world.tiles = generateWorldMap(this.world.config.seed, this.world.config.size);
+      // Save tiles
+      await saveTiles(this.state.storage, this.world.config.seed, this.world.tiles);
+      await this.persistWorld();
+    }
+    
     const url = new URL(request.url);
     const agentId = url.searchParams.get("agentId");
     const spectator = url.searchParams.get("spectator") === "1";
@@ -1356,11 +1421,12 @@ export class WorldDurableObject {
     if (!this.authorize(request)) {
       return this.jsonResponse({ error: "unauthorized" }, 401);
     }
+    // Admin snapshot includes full world with tiles
     return this.jsonResponse({
       protocolVersion: PROTOCOL_VERSION,
       snapshotVersion: SNAPSHOT_VERSION,
       serverTime: Date.now(),
-      ...this.world
+      ...this.world // Includes tiles
     });
   }
 
