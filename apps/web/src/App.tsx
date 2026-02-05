@@ -290,10 +290,9 @@ const App = () => {
     try {
       const url = new URL(`${HTTP_BASE}/world/snapshot`);
       url.searchParams.set("worldId", worldId);
-      // Humans always use spectator mode with admin token
-      const response = await fetch(url.toString(), {
-        headers: { "x-admin-token": adminToken }
-      });
+      url.searchParams.set("spectator", "1");
+      // Spectator mode - no admin token needed
+      const response = await fetch(url.toString());
       if (!response.ok) {
         return;
       }
@@ -312,7 +311,7 @@ const App = () => {
     } catch (error) {
       console.error("Failed to fetch snapshot", error);
     }
-  }, [HTTP_BASE, worldId, adminToken]);
+  }, [HTTP_BASE, worldId]);
 
   const connectWs = useCallback(() => {
     const url = new URL(resolvedWsUrl);

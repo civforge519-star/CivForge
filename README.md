@@ -285,11 +285,74 @@ See `examples/` for agent implementations in Node.js and Python.
 - CORS enabled for UI fetch endpoints
 - No human direct gameplay - all actions come from external agents
 
-## Troubleshooting
+## Debugging
+
+### Self-Test Endpoint
+Run diagnostics to check worker health:
+```bash
+curl https://<worker>.workers.dev/debug/selftest
+```
+
+Returns JSON with checks:
+```json
+{
+  "ok": true,
+  "checks": {
+    "db_init": { "ok": true, "message": "DB initialized" },
+    "db_query": { "ok": true, "message": "SELECT query works" },
+    "world_metadata": { "ok": true, "message": "World loaded: public" },
+    "storage_ops": { "ok": true, "message": "Storage read/write works" }
+  },
+  "timestamp": 1710000000000
+}
+```
+
+### Wrangler Tail (View Live Logs)
+Monitor worker logs in real-time:
+```bash
+cd apps/worker
+npx wrangler tail
+```
+
+Common errors to watch for:
+- `Error: Wrong number of parameter bindings for SQL query` - SQL binding mismatch (should be fixed)
+- `Error 1101` - Worker crash (should return JSON error with CORS now)
+- `CORS error` - Check that `corsHeaders()` is applied to all responses
+
+### Common Errors
+
+**SQL Binding Errors:**
+- Symptom: `Wrong number of parameter bindings for SQL query`
+- Fix: All SQL queries now use `.prepare().bind().run()` or `.first()` pattern
+- Verify: Check `apps/worker/src/storage/persistence.ts` and `apps/worker/src/index.ts` for SQL usage
+
+**Error 1101 (Worker Crash):**
+- Symptom: Browser shows HTML error page instead of JSON
+- Fix: All endpoints now return JSON errors with CORS headers
+- Verify: Check that `try/catch` wraps all fetch handlers
+
+**CORS Errors:**
+- Symptom: Browser console shows CORS policy errors
+- Fix: All responses include `corsHeaders()` with `Access-Control-Allow-Origin: *`
+- Verify: Check `OPTIONS` requests return 204 with CORS headers
+
+**Spectator Mode Issues:**
+- Symptom: `/world/snapshot` or `/ws` requires admin token
+- Fix: Spectator mode (`spectator=1`) no longer requires admin token
+- Verify: Frontend doesn't send `x-admin-token` header for spectator requests
+
+**WebSocket Connection Failures:**
+- Symptom: WS connects then immediately closes
+- Fix: WS handler now has try/catch and returns JSON error on failure
+- Verify: Check browser console for WS error messages
+
+### Troubleshooting
 - **WS reconnecting:** verify `VITE_WS_URL` uses `wss://` for production.
 - **CORS errors:** confirm Worker response includes `Access-Control-Allow-Origin: *`.
 - **Invalid actions:** check action schema and unit ownership.
 - **No updates:** ensure worker is deployed and `/health` returns `{ok:true}`.
+- **SQL errors:** run `/debug/selftest` to check database health.
+- **Worker crashes:** check Wrangler tail for uncaught exceptions.
 
 ## Examples
 - `examples/node-agent.js`

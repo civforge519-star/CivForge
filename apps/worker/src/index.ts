@@ -59,20 +59,54 @@ const REGISTRY_WORLD_ID = "__registry__";
 const PROTOCOL_VERSION = "1.1";
 const SNAPSHOT_VERSION = 2;
 
+const corsHeaders = (origin?: string): HeadersInit => ({
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type,Authorization,x-admin-token,x-world-id",
+  "Access-Control-Max-Age": "86400"
+});
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const pathname = url.pathname;
-    const worldId = url.searchParams.get("worldId") ?? DEFAULT_WORLD_ID;
+    try {
+      // Handle OPTIONS globally at top level
+      if (request.method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: corsHeaders()
+        });
+      }
 
-    if (pathname === "/worlds" || pathname.startsWith("/worlds/")) {
-      const registryStub = env.WORLD_DO.get(env.WORLD_DO.idFromName(REGISTRY_WORLD_ID));
-      url.searchParams.set("worldId", REGISTRY_WORLD_ID);
-      return registryStub.fetch(new Request(url.toString(), request));
+      const url = new URL(request.url);
+      const pathname = url.pathname;
+      const worldId = url.searchParams.get("worldId") ?? DEFAULT_WORLD_ID;
+
+      if (pathname === "/worlds" || pathname.startsWith("/worlds/")) {
+        const registryStub = env.WORLD_DO.get(env.WORLD_DO.idFromName(REGISTRY_WORLD_ID));
+        url.searchParams.set("worldId", REGISTRY_WORLD_ID);
+        return registryStub.fetch(new Request(url.toString(), request));
+      }
+
+      const stub = env.WORLD_DO.get(env.WORLD_DO.idFromName(worldId));
+      return stub.fetch(new Request(url.toString(), request));
+    } catch (error) {
+      console.error("Top-level fetch error:", error);
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "internal_error",
+          message: String(error),
+          stack: error instanceof Error ? error.stack : undefined
+        }),
+        {
+          status: 500,
+          headers: {
+            "Content-Type": "application/json",
+            ...corsHeaders()
+          }
+        }
+      );
     }
-
-    const stub = env.WORLD_DO.get(env.WORLD_DO.idFromName(worldId));
-    return stub.fetch(new Request(url.toString(), request));
   }
 };
 
@@ -130,10 +164,11 @@ export class WorldDurableObject {
   }
 
   async fetch(request: Request): Promise<Response> {
-    await this.initPromise;
-    const url = new URL(request.url);
-    const pathname = url.pathname;
-    let worldId = url.searchParams.get("worldId") ?? DEFAULT_WORLD_ID;
+    try {
+      await this.initPromise;
+      const url = new URL(request.url);
+      const pathname = url.pathname;
+      let worldId = url.searchParams.get("worldId") ?? DEFAULT_WORLD_ID;
     // Normalize "public" to DEFAULT_WORLD_ID
     if (worldId === "public" || worldId === DEFAULT_WORLD_ID) {
       worldId = DEFAULT_WORLD_ID;
@@ -154,16 +189,16 @@ export class WorldDurableObject {
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
-        headers: {
-          "access-control-allow-origin": "*",
-          "access-control-allow-methods": "GET,POST,OPTIONS",
-          "access-control-allow-headers": "content-type,x-admin-token,authorization"
-        }
+        headers: corsHeaders()
       });
     }
 
     if (pathname === "/health") {
       return this.jsonResponse({ ok: true });
+    }
+
+    if (pathname === "/debug/selftest") {
+      return this.handleSelfTest();
     }
 
     if (pathname === "/health/diagnostics") {
@@ -270,6 +305,14 @@ export class WorldDurableObject {
 
     if (pathname.startsWith("/agent/") && pathname.endsWith("/act")) {
       return this.actAgentEndpoint(request);
+    }
+
+    if (pathname.startsWith("/agent/") && pathname.endsWith("/story")) {
+      const agentId = pathname.split("/agent/")[1]?.split("/")[0];
+      if (!agentId || !this.world?.agentStories[agentId]) {
+        return this.jsonResponse({ error: "agent_story_not_found" }, 404);
+      }
+      return this.jsonResponse({ story: this.world.agentStories[agentId] });
     }
 
     if (pathname === "/admin/agents") {
@@ -470,7 +513,19 @@ export class WorldDurableObject {
       return this.jsonResponse({ status: "event_added" });
     }
 
-    return new Response("Not found", { status: 404 });
+    return this.jsonResponse({ error: "not_found" }, 404);
+    } catch (error) {
+      console.error("WorldDurableObject.fetch error:", error);
+      return this.jsonResponse(
+        {
+          ok: false,
+          error: "internal_error",
+          message: String(error),
+          stack: error instanceof Error ? error.stack : undefined
+        },
+        500
+      );
+    }
   }
 
   async alarm(): Promise<void> {
@@ -557,58 +612,96 @@ export class WorldDurableObject {
   }
 
   private handleWebSocket(request: Request): Response {
-    const pair = new WebSocketPair();
-    const client = pair[0];
-    const server = pair[1];
+    try {
+      const pair = new WebSocketPair();
+      const client = pair[0];
+      const server = pair[1];
 
-    server.accept();
-    this.clients.add(server);
-    const url = new URL(request.url);
-    const agentId = url.searchParams.get("agentId") ?? undefined;
-    const spectator = url.searchParams.get("spectator") === "1";
-    const token = url.searchParams.get("token");
-    this.clientMeta.set(server, { agentId, spectator, token });
-    server.addEventListener("close", () => {
-      this.clients.delete(server);
-      this.clientMeta.delete(server);
-    });
-    server.addEventListener("message", (event) => {
-      try {
-        const data = JSON.parse(String(event.data)) as { type: string; viewport?: { x: number; y: number; w: number; h: number; lod: number } };
-        if (data.type === "ping") {
-          safeSend(server, { type: "pong", tick: this.world?.tick ?? 0 });
-          return;
-        }
-        if (data.type === "subscribe" && data.viewport) {
-          const meta = this.clientMeta.get(server) ?? {};
-          this.clientMeta.set(server, { ...meta, viewport: data.viewport });
-          if (this.world) {
-            const tiles = tilesForViewport(this.world, data.viewport, meta.agentId);
-            server.send(JSON.stringify({ type: "chunk_update", chunks: tiles, tick: this.world.tick }));
+      server.accept();
+      this.clients.add(server);
+      const url = new URL(request.url);
+      const agentId = url.searchParams.get("agentId") ?? undefined;
+      const spectator = url.searchParams.get("spectator") === "1";
+      const token = url.searchParams.get("token");
+      this.clientMeta.set(server, { agentId, spectator, token });
+      server.addEventListener("close", () => {
+        this.clients.delete(server);
+        this.clientMeta.delete(server);
+      });
+      server.addEventListener("message", (event) => {
+        try {
+          const data = JSON.parse(String(event.data)) as { type: string; viewport?: { x: number; y: number; w: number; h: number; lod: number } };
+          if (data.type === "ping") {
+            safeSend(server, { type: "pong", tick: this.world?.tick ?? 0 });
+            return;
+          }
+          if (data.type === "subscribe" && data.viewport) {
+            const meta = this.clientMeta.get(server) ?? {};
+            this.clientMeta.set(server, { ...meta, viewport: data.viewport });
+            if (this.world) {
+              const tiles = tilesForViewport(this.world, data.viewport, meta.agentId);
+              server.send(JSON.stringify({ type: "chunk_update", chunks: tiles, tick: this.world.tick }));
+            }
+          }
+        } catch (error) {
+          console.error("WS message error:", error);
+          try {
+            server.send(JSON.stringify({ type: "error", message: "invalid_message" }));
+          } catch (sendError) {
+            // Socket may be closed
           }
         }
-      } catch (error) {
-        server.send(JSON.stringify({ type: "error", message: "invalid_message" }));
-      }
-    });
+      });
 
-    if (this.world) {
-      if (agentId && token && this.world.agents[agentId]) {
-        this.verifyAgentAuthToken(token, this.world.agents[agentId]).then((ok) => {
-          if (!ok) {
-            server.send(JSON.stringify({ type: "error", message: "unauthorized" }));
-            server.close();
+      if (this.world) {
+        if (agentId && token && this.world.agents[agentId]) {
+          this.verifyAgentAuthToken(token, this.world.agents[agentId]).then((ok) => {
+            if (!ok) {
+              try {
+                server.send(JSON.stringify({ type: "error", message: "unauthorized" }));
+                server.close(1008, "Unauthorized");
+              } catch (closeError) {
+                // Socket may already be closed
+              }
+            }
+          }).catch((error) => {
+            console.error("WS auth error:", error);
+            try {
+              server.close(1011, "Auth error");
+            } catch (closeError) {
+              // Socket may already be closed
+            }
+          });
+        }
+        try {
+          const snapshot = this.buildSnapshotForClient(this.clientMeta.get(server));
+          safeSend(server, snapshot);
+        } catch (error) {
+          console.error("WS snapshot error:", error);
+          try {
+            server.close(1011, "Snapshot error");
+          } catch (closeError) {
+            // Socket may already be closed
           }
-        });
+        }
       }
-      const snapshot = this.buildSnapshotForClient(this.clientMeta.get(server));
-      safeSend(server, snapshot);
+
+      return new Response(null, {
+        status: 101,
+        webSocket: client
+      });
+    } catch (error) {
+      console.error("WS handler error:", error);
+      return this.jsonResponse(
+        {
+          ok: false,
+          error: "ws_error",
+          message: String(error),
+          stack: error instanceof Error ? error.stack : undefined
+        },
+        500
+      );
     }
-
-    return new Response(null, {
-      status: 101,
-      webSocket: client
-    });
   }
 
   private handleAgentWebSocket(request: Request): Response {
@@ -647,7 +740,8 @@ export class WorldDurableObject {
   }
 
   private authorize(request: Request): boolean {
-    const token = request.headers.get("x-admin-token");
+    // Support both x-admin-token header and Authorization header for compatibility
+    const token = request.headers.get("x-admin-token") ?? request.headers.get("authorization")?.replace("Bearer ", "");
     return Boolean(this.env.ADMIN_TOKEN && token && token === this.env.ADMIN_TOKEN);
   }
 
@@ -768,10 +862,8 @@ export class WorldDurableObject {
     return new Response(JSON.stringify(body), {
       status,
       headers: {
-        "content-type": "application/json",
-        "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET,POST,OPTIONS",
-        "access-control-allow-headers": "content-type,x-admin-token,authorization"
+        "Content-Type": "application/json",
+        ...corsHeaders()
       }
     });
   }
@@ -1000,10 +1092,64 @@ export class WorldDurableObject {
   }
 
   private logAudit(entry: { id: string; type: string; data: unknown }): void {
-    this.state.storage.sql.exec("INSERT OR REPLACE INTO audit_logs (id, data) VALUES (?, ?)", [
-      entry.id,
-      JSON.stringify(entry)
-    ]);
+    try {
+      this.state.storage.sql.prepare("INSERT OR REPLACE INTO audit_logs (id, data) VALUES (?, ?)").bind(entry.id, JSON.stringify(entry)).run();
+    } catch (error) {
+      console.error("logAudit error:", error);
+      // Don't throw - audit logging failures shouldn't crash the app
+    }
+  }
+
+  private async handleSelfTest(): Promise<Response> {
+    const checks: Record<string, { ok: boolean; message?: string; error?: string }> = {};
+    
+    // Test 1: DB initialization
+    try {
+      const testResult = this.state.storage.sql.prepare("SELECT 1 as test").first();
+      checks.db_init = { ok: true, message: "DB initialized" };
+    } catch (error) {
+      checks.db_init = { ok: false, error: String(error) };
+    }
+
+    // Test 2: Simple SELECT query
+    try {
+      const result = this.state.storage.sql.prepare("SELECT data FROM world_state WHERE id = 1").first();
+      checks.db_query = { ok: true, message: "SELECT query works" };
+    } catch (error) {
+      checks.db_query = { ok: false, error: String(error) };
+    }
+
+    // Test 3: World metadata read
+    try {
+      const hasWorld = this.world !== null && this.world !== undefined;
+      checks.world_metadata = { 
+        ok: hasWorld, 
+        message: hasWorld ? `World loaded: ${this.world?.worldId ?? "unknown"}` : "No world loaded" 
+      };
+    } catch (error) {
+      checks.world_metadata = { ok: false, error: String(error) };
+    }
+
+    // Test 4: Storage operations
+    try {
+      const testKey = "__selftest__";
+      await this.state.storage.put(testKey, "test");
+      const retrieved = await this.state.storage.get(testKey);
+      await this.state.storage.delete(testKey);
+      checks.storage_ops = { ok: retrieved === "test", message: "Storage read/write works" };
+    } catch (error) {
+      checks.storage_ops = { ok: false, error: String(error) };
+    }
+
+    const allOk = Object.values(checks).every(c => c.ok);
+    return this.jsonResponse(
+      {
+        ok: allOk,
+        checks,
+        timestamp: Date.now()
+      },
+      allOk ? 200 : 500
+    );
   }
 
   private async pullAgentActions(): Promise<void> {
@@ -1161,6 +1307,9 @@ export class WorldDurableObject {
     }
     const url = new URL(request.url);
     const agentId = url.searchParams.get("agentId");
+    const spectator = url.searchParams.get("spectator") === "1";
+    const token = url.searchParams.get("token");
+    
     if (agentId && this.world.agents[agentId]) {
       if (!(await this.verifyAgentAuth(request, this.world.agents[agentId]))) {
         return this.jsonResponse({ error: "unauthorized" }, 401);
@@ -1174,6 +1323,18 @@ export class WorldDurableObject {
         fog
       });
     }
+    
+    // Allow spectator access without admin token
+    if (spectator) {
+      return this.jsonResponse({
+        protocolVersion: PROTOCOL_VERSION,
+        snapshotVersion: SNAPSHOT_VERSION,
+        serverTime: Date.now(),
+        ...this.buildSnapshotForClient({ spectator: true, token })
+      });
+    }
+    
+    // Full admin access requires authorization
     if (!this.authorize(request)) {
       return this.jsonResponse({ error: "unauthorized" }, 401);
     }
