@@ -1,23 +1,36 @@
 import type { WorldState } from "../types";
 
 type StorageState = DurableObjectState["storage"];
+type SqlStorage = DurableObjectState["storage"]["sql"];
+
+// Helper functions for SQL operations
+function exec(sql: SqlStorage, query: string, ...args: any[]): void {
+  sql.exec(query, ...args);
+}
+
+function one<T = any>(sql: SqlStorage, query: string, ...args: any[]): T | null {
+  const arr = sql.exec(query, ...args).toArray() as T[];
+  return arr.length ? arr[0] : null;
+}
+
+function all<T = any>(sql: SqlStorage, query: string, ...args: any[]): T[] {
+  return sql.exec(query, ...args).toArray() as T[];
+}
 
 export const initStorage = (state: DurableObjectState): void => {
-  state.storage.sql.exec(
-    "CREATE TABLE IF NOT EXISTS world_state (id INTEGER PRIMARY KEY, data TEXT NOT NULL)"
-  );
-  state.storage.sql.exec(
-    "CREATE TABLE IF NOT EXISTS world_tiles (seed TEXT PRIMARY KEY, data TEXT NOT NULL)"
-  );
-  state.storage.sql.exec(
-    "CREATE TABLE IF NOT EXISTS world_snapshots (tick INTEGER PRIMARY KEY, data TEXT NOT NULL)"
-  );
+  try {
+    exec(state.storage.sql, "CREATE TABLE IF NOT EXISTS world_state (id INTEGER PRIMARY KEY, data TEXT NOT NULL)");
+    exec(state.storage.sql, "CREATE TABLE IF NOT EXISTS world_tiles (seed TEXT PRIMARY KEY, data TEXT NOT NULL)");
+    exec(state.storage.sql, "CREATE TABLE IF NOT EXISTS world_snapshots (tick INTEGER PRIMARY KEY, data TEXT NOT NULL)");
+  } catch (error) {
+    console.error("initStorage error:", error);
+    // Don't throw - allow in-memory world to continue
+  }
 };
 
 export const loadWorldState = async (state: DurableObjectState): Promise<WorldState | null> => {
   try {
-    const stmt = state.storage.sql.prepare("SELECT data FROM world_state WHERE id = 1");
-    const row = stmt.first<{ data: string }>();
+    const row = one<{ data: string }>(state.storage.sql, "SELECT data FROM world_state WHERE id = 1");
     if (!row?.data) {
       return null;
     }
@@ -41,10 +54,10 @@ export const saveWorldState = async (state: DurableObjectState, world: WorldStat
       await saveTiles(state.storage, world.config.seed, world.tiles);
     }
     const data = JSON.stringify({ ...world, tiles: [] });
-    state.storage.sql.prepare("INSERT OR REPLACE INTO world_state (id, data) VALUES (1, ?)").bind(data).run();
+    exec(state.storage.sql, "INSERT OR REPLACE INTO world_state (id, data) VALUES (1, ?)", data);
   } catch (error) {
     console.error("saveWorldState error:", error);
-    throw error;
+    // Don't throw - allow world to continue in memory
   }
 };
 
@@ -57,17 +70,16 @@ export const saveSnapshot = async (state: DurableObjectState, world: WorldState)
       states: world.states,
       events: world.events
     });
-    state.storage.sql.prepare("INSERT OR REPLACE INTO world_snapshots (tick, data) VALUES (?, ?)").bind(world.tick, snapshot).run();
+    exec(state.storage.sql, "INSERT OR REPLACE INTO world_snapshots (tick, data) VALUES (?, ?)", world.tick, snapshot);
   } catch (error) {
     console.error("saveSnapshot error:", error);
-    throw error;
+    // Don't throw - snapshot failures shouldn't crash the world
   }
 };
 
 export const loadSnapshot = async (state: DurableObjectState, tick: number): Promise<WorldState["snapshots"][number] | null> => {
   try {
-    const stmt = state.storage.sql.prepare("SELECT data FROM world_snapshots WHERE tick = ?");
-    const row = stmt.bind(tick).first<{ data: string }>();
+    const row = one<{ data: string }>(state.storage.sql, "SELECT data FROM world_snapshots WHERE tick = ?", tick);
     if (!row?.data) {
       return null;
     }
@@ -80,8 +92,7 @@ export const loadSnapshot = async (state: DurableObjectState, tick: number): Pro
 
 const hasTiles = async (storage: StorageState, seed: string): Promise<boolean> => {
   try {
-    const stmt = storage.sql.prepare("SELECT seed FROM world_tiles WHERE seed = ?");
-    const row = stmt.bind(seed).first<{ seed: string }>();
+    const row = one<{ seed: string }>(storage.sql, "SELECT seed FROM world_tiles WHERE seed = ?", seed);
     return Boolean(row);
   } catch (error) {
     console.error("hasTiles error:", error);
@@ -91,17 +102,16 @@ const hasTiles = async (storage: StorageState, seed: string): Promise<boolean> =
 
 const saveTiles = async (storage: StorageState, seed: string, tiles: WorldState["tiles"]): Promise<void> => {
   try {
-    storage.sql.prepare("INSERT OR REPLACE INTO world_tiles (seed, data) VALUES (?, ?)").bind(seed, JSON.stringify(tiles)).run();
+    exec(storage.sql, "INSERT OR REPLACE INTO world_tiles (seed, data) VALUES (?, ?)", seed, JSON.stringify(tiles));
   } catch (error) {
     console.error("saveTiles error:", error);
-    throw error;
+    // Don't throw - tile save failures shouldn't crash
   }
 };
 
 const loadTiles = async (storage: StorageState, seed: string): Promise<WorldState["tiles"] | null> => {
   try {
-    const stmt = storage.sql.prepare("SELECT data FROM world_tiles WHERE seed = ?");
-    const row = stmt.bind(seed).first<{ data: string }>();
+    const row = one<{ data: string }>(storage.sql, "SELECT data FROM world_tiles WHERE seed = ?", seed);
     if (!row?.data) {
       return null;
     }

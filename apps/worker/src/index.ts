@@ -136,30 +136,48 @@ export class WorldDurableObject {
   }
 
   private async initialize(): Promise<void> {
-    initStorage(this.state);
-    this.state.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS audit_logs (id TEXT PRIMARY KEY, data TEXT NOT NULL)"
-    );
-    const loaded = await loadWorldState(this.state);
-    if (loaded) {
-      this.world = loaded;
-      this.worldId = loaded.worldId;
-      // Ensure public world always uses DEFAULT_WORLD_ID
-      if (this.world.type === "public" && this.world.worldId !== DEFAULT_WORLD_ID) {
-        this.world.worldId = DEFAULT_WORLD_ID;
-        this.worldId = DEFAULT_WORLD_ID;
+    try {
+      initStorage(this.state);
+      this.state.storage.sql.exec(
+        "CREATE TABLE IF NOT EXISTS audit_logs (id TEXT PRIMARY KEY, data TEXT NOT NULL)"
+      );
+    } catch (error) {
+      console.error("Storage initialization error:", error);
+      // Continue with in-memory world so WS can still connect
+    }
+    
+    try {
+      const loaded = await loadWorldState(this.state);
+      if (loaded) {
+        this.world = loaded;
+        this.worldId = loaded.worldId;
+        // Ensure public world always uses DEFAULT_WORLD_ID
+        if (this.world.type === "public" && this.world.worldId !== DEFAULT_WORLD_ID) {
+          this.world.worldId = DEFAULT_WORLD_ID;
+          this.worldId = DEFAULT_WORLD_ID;
+          await this.persistWorld();
+        }
+      } else {
+        const size = Number(this.env.WORLD_SIZE ?? 128);
+        const tickRate = Number(this.env.TICK_RATE ?? 1);
+        const seed = this.worldId;
+        // Ensure public world always uses DEFAULT_WORLD_ID
+        const finalWorldId = this.worldId === DEFAULT_WORLD_ID || this.worldId === "public" ? DEFAULT_WORLD_ID : this.worldId;
+        this.world = createWorld(finalWorldId, seed, size, tickRate, finalWorldId === DEFAULT_WORLD_ID ? "public" : "sandbox");
+        this.worldId = finalWorldId;
         await this.persistWorld();
       }
-    } else {
+    } catch (error) {
+      console.error("World initialization error:", error);
+      // Create in-memory world as fallback
       const size = Number(this.env.WORLD_SIZE ?? 128);
       const tickRate = Number(this.env.TICK_RATE ?? 1);
       const seed = this.worldId;
-      // Ensure public world always uses DEFAULT_WORLD_ID
       const finalWorldId = this.worldId === DEFAULT_WORLD_ID || this.worldId === "public" ? DEFAULT_WORLD_ID : this.worldId;
       this.world = createWorld(finalWorldId, seed, size, tickRate, finalWorldId === DEFAULT_WORLD_ID ? "public" : "sandbox");
       this.worldId = finalWorldId;
-      await this.persistWorld();
     }
+    
     await this.scheduleNextTick();
   }
 
@@ -1093,7 +1111,7 @@ export class WorldDurableObject {
 
   private logAudit(entry: { id: string; type: string; data: unknown }): void {
     try {
-      this.state.storage.sql.prepare("INSERT OR REPLACE INTO audit_logs (id, data) VALUES (?, ?)").bind(entry.id, JSON.stringify(entry)).run();
+      this.state.storage.sql.exec("INSERT OR REPLACE INTO audit_logs (id, data) VALUES (?, ?)", entry.id, JSON.stringify(entry));
     } catch (error) {
       console.error("logAudit error:", error);
       // Don't throw - audit logging failures shouldn't crash the app
@@ -1105,15 +1123,15 @@ export class WorldDurableObject {
     
     // Test 1: DB initialization
     try {
-      const testResult = this.state.storage.sql.prepare("SELECT 1 as test").first();
-      checks.db_init = { ok: true, message: "DB initialized" };
+      const arr = this.state.storage.sql.exec("SELECT 1 as test").toArray();
+      checks.db_init = { ok: arr.length > 0, message: "DB initialized" };
     } catch (error) {
       checks.db_init = { ok: false, error: String(error) };
     }
 
     // Test 2: Simple SELECT query
     try {
-      const result = this.state.storage.sql.prepare("SELECT data FROM world_state WHERE id = 1").first();
+      const arr = this.state.storage.sql.exec("SELECT data FROM world_state WHERE id = 1").toArray();
       checks.db_query = { ok: true, message: "SELECT query works" };
     } catch (error) {
       checks.db_query = { ok: false, error: String(error) };
