@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { buildHttpBase, buildWsUrl, safeParseJson } from "./net";
 import { createCamera, screenToWorld, updateCamera, worldToScreen, clamp, resetToFit } from "./camera";
-import { drawBorders, drawFog, drawOverlay, getChunkCanvas, drawCheckerboard } from "./renderer";
+import { drawBorders, drawFog, drawOverlay, getChunkCanvas, drawCheckerboard, drawTilesInViewport } from "./renderer";
 
 type Biome =
   | "ocean"
@@ -146,7 +146,7 @@ const biomeColors: Record<Biome, string> = {
   river: "#4aa3df"
 };
 
-const CHUNK_SIZE = 16;
+const CHUNK_SIZE = 128; // Match backend chunk size
 const decodeChunkSet = (chunks?: string[] | null): Set<string> | null => {
   if (!chunks) {
     return null;
@@ -564,19 +564,30 @@ const App = () => {
     }
     chunkCache.current.clear();
     
-    // Auto-fit camera on first world load
-    if (!hasFittedCamera.current && canvasSize.current.width > 0 && canvasSize.current.height > 0) {
-      resetToFit(camera.current, world.config.size, canvasSize.current.width, canvasSize.current.height);
-      hasFittedCamera.current = true;
+    // Auto-fit camera on first world load - ensure it happens after canvas is sized
+    const fitCamera = () => {
+      if (canvasSize.current.width > 0 && canvasSize.current.height > 0) {
+        resetToFit(camera.current, world.config.size, canvasSize.current.width, canvasSize.current.height);
+        hasFittedCamera.current = true;
+        needsRender.current = true;
+      } else {
+        // Retry if canvas not sized yet
+        setTimeout(fitCamera, 100);
+      }
+    };
+    
+    if (!hasFittedCamera.current) {
+      fitCamera();
     } else {
+      // Ensure camera is at least centered
       camera.current.x = world.config.size / 2;
       camera.current.y = world.config.size / 2;
+      needsRender.current = true;
     }
     
     renderMinimap(world);
-    needsRender.current = true;
     lastSnapshotTime.current = Date.now();
-  }, [world?.worldId]);
+  }, [world?.worldId, canvasSize.current.width, canvasSize.current.height]);
 
   // ResizeObserver for canvas sizing
   useEffect(() => {
@@ -891,18 +902,27 @@ const App = () => {
       );
     }
 
+    // Render tiles directly with proper viewport culling
     const startChunkX = Math.floor(view.left / CHUNK_SIZE);
     const startChunkY = Math.floor(view.top / CHUNK_SIZE);
     const endChunkX = Math.floor(view.right / CHUNK_SIZE);
     const endChunkY = Math.floor(view.bottom / CHUNK_SIZE);
-
-    for (let cy = startChunkY; cy <= endChunkY; cy += 1) {
-      for (let cx = startChunkX; cx <= endChunkX; cx += 1) {
-        const chunkCanvas = getChunkCanvas(world, cx, cy, CHUNK_SIZE, chunkCache.current, biomeColors);
-        const screenX = (cx * CHUNK_SIZE - view.left) * cam.zoom;
-        const screenY = (cy * CHUNK_SIZE - view.top) * cam.zoom;
-        ctx.drawImage(chunkCanvas, screenX, screenY, CHUNK_SIZE * cam.zoom, CHUNK_SIZE * cam.zoom);
-      }
+    
+    let tilesRendered = 0;
+    let chunksRendered = 0;
+    
+    if (world.tiles && world.tiles.length > 0) {
+      // Use direct tile rendering for better performance and correctness
+      const result = drawTilesInViewport(ctx, world, view, cam.zoom, biomeColors);
+      tilesRendered = result.tilesRendered;
+      chunksRendered = (endChunkX - startChunkX + 1) * (endChunkY - startChunkY + 1);
+    } else {
+      // Fallback: draw checkerboard if tiles missing
+      drawCheckerboard(ctx, width, height, 32);
+      ctx.fillStyle = "rgba(255,255,255,0.8)";
+      ctx.font = "16px Inter";
+      ctx.textAlign = "center";
+      ctx.fillText("Waiting for tiles...", width / 2, height / 2);
     }
 
     if (quality !== "low") {
@@ -1037,8 +1057,15 @@ const App = () => {
       (window as any).__CIVFORGE_DEBUG__ = {
         world: { worldId: world.worldId, tick: world.tick, size: world.config.size },
         tilesCount: world.tiles?.length || 0,
+        tilesRendered: tilesRendered,
+        chunksRendered: chunksRendered,
+        visibleChunkRange: {
+          start: { x: startChunkX, y: startChunkY },
+          end: { x: endChunkX, y: endChunkY }
+        },
         agentsCount: Object.keys(world.units || {}).length,
         camera: { x: cam.x, y: cam.y, zoom: cam.zoom },
+        viewport: { left: view.left, top: view.top, right: view.right, bottom: view.bottom },
         zoom: cam.zoom,
         lastSnapshot: lastSnapshotTime.current,
         lastRenderError: lastRenderError.current,
@@ -1255,9 +1282,21 @@ const App = () => {
               <div>DPR: {window.devicePixelRatio || 1}</div>
               <div>World Size: {world?.config?.size || "N/A"}</div>
               <div>Tiles: {world?.tiles?.length || 0} {world?.tiles?.length ? "✓" : "✗"}</div>
+              {typeof window !== "undefined" && (window as any).__CIVFORGE_DEBUG__ && (
+                <>
+                  <div>Tiles Rendered: {(window as any).__CIVFORGE_DEBUG__.tilesRendered || 0}</div>
+                  <div>Chunks Rendered: {(window as any).__CIVFORGE_DEBUG__.chunksRendered || 0}</div>
+                  {(window as any).__CIVFORGE_DEBUG__.visibleChunkRange && (
+                    <div>Chunk Range: ({Math.floor((window as any).__CIVFORGE_DEBUG__.visibleChunkRange.start.x)}, {Math.floor((window as any).__CIVFORGE_DEBUG__.visibleChunkRange.start.y)}) to ({Math.floor((window as any).__CIVFORGE_DEBUG__.visibleChunkRange.end.x)}, {Math.floor((window as any).__CIVFORGE_DEBUG__.visibleChunkRange.end.y)})</div>
+                  )}
+                  {(window as any).__CIVFORGE_DEBUG__.viewport && (
+                    <div>Viewport: ({Math.floor((window as any).__CIVFORGE_DEBUG__.viewport.left)}, {Math.floor((window as any).__CIVFORGE_DEBUG__.viewport.top)}) to ({Math.floor((window as any).__CIVFORGE_DEBUG__.viewport.right)}, {Math.floor((window as any).__CIVFORGE_DEBUG__.viewport.bottom)})</div>
+                  )}
+                </>
+              )}
               <div>Agents: {world ? Object.keys(world.units || {}).length : 0} {world && Object.keys(world.units || {}).length > 0 ? "✓" : "✗"}</div>
               <div>Last Snapshot: {lastSnapshotTime.current ? new Date(lastSnapshotTime.current).toLocaleTimeString() : "Never"}</div>
-              <div>Camera: x={camera.current.x.toFixed(1)} y={camera.current.y.toFixed(1)} zoom={camera.current.zoom.toFixed(2)}</div>
+              <div>Camera: x={camera.current.x.toFixed(1)} y={camera.current.y.toFixed(1)} zoom={camera.current.zoom.toFixed(3)}</div>
               {lastRenderError.current && (
                 <div style={{ color: "#ff5d5d", marginTop: 4 }}>Error: {lastRenderError.current.substring(0, 60)}</div>
               )}

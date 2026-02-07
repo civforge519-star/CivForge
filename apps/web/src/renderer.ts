@@ -12,6 +12,61 @@ export const shadeColor = (color: string, percent: number) => {
   return `#${(0x1000000 + (r << 16) + (g << 8) + b).toString(16).slice(1)}`;
 };
 
+/**
+ * Render tiles directly to main canvas using proper world-to-screen transforms
+ * This replaces chunk canvas approach for better viewport culling
+ */
+export const drawTilesInViewport = (
+  ctx: CanvasRenderingContext2D,
+  worldState: { config: { size: number }; tiles: Array<any | null> },
+  view: { left: number; top: number; right: number; bottom: number },
+  zoom: number,
+  biomeColors: Record<string, string>
+): { tilesRendered: number } => {
+  let tilesRendered = 0;
+  
+  // Calculate visible tile range
+  const startX = Math.max(0, Math.floor(view.left));
+  const startY = Math.max(0, Math.floor(view.top));
+  const endX = Math.min(worldState.config.size - 1, Math.ceil(view.right));
+  const endY = Math.min(worldState.config.size - 1, Math.ceil(view.bottom));
+  
+  // Draw tiles in viewport
+  for (let wy = startY; wy <= endY; wy += 1) {
+    for (let wx = startX; wx <= endX; wx += 1) {
+      // Calculate screen position
+      const screenX = (wx - view.left) * zoom;
+      const screenY = (wy - view.top) * zoom;
+      const tileSize = Math.max(1, zoom);
+      
+      // Skip if outside viewport (with small margin for partial tiles)
+      if (screenX + tileSize < -1 || screenX > ctx.canvas.width + 1 || 
+          screenY + tileSize < -1 || screenY > ctx.canvas.height + 1) {
+        continue;
+      }
+      
+      const tileIndex = wy * worldState.config.size + wx;
+      const tile = worldState.tiles[tileIndex];
+      
+      if (!tile) {
+        // Draw dark background for missing tiles
+        ctx.fillStyle = "#0b0f14";
+        ctx.fillRect(screenX, screenY, tileSize, tileSize);
+      } else {
+        // Draw tile with biome color and elevation shading
+        const base = biomeColors[tile.biome] ?? "#0b0f14";
+        const shade = Math.floor(30 * (tile.elevation - 0.5));
+        ctx.fillStyle = shadeColor(base, shade);
+        ctx.fillRect(screenX, screenY, tileSize, tileSize);
+        
+        tilesRendered += 1;
+      }
+    }
+  }
+  
+  return { tilesRendered };
+};
+
 export const getChunkCanvas = (
   worldState: { worldId: string; config: { size: number }; tiles: Array<any | null> },
   cx: number,
