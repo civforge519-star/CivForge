@@ -89,6 +89,22 @@ export default {
       const pathname = url.pathname;
       const worldId = url.searchParams.get("worldId") ?? DEFAULT_WORLD_ID;
 
+      // WebSocket upgrade handling: require Upgrade header for /ws
+      if (pathname === "/ws") {
+        if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+          return new Response(
+            JSON.stringify({ ok: false, error: "upgrade_required", message: "WebSocket upgrade required" }),
+            {
+              status: 426,
+              headers: {
+                "Content-Type": "application/json",
+                ...corsHeaders()
+              }
+            }
+          );
+        }
+      }
+
       if (pathname === "/worlds" || pathname.startsWith("/worlds/")) {
         const registryStub = env.WORLD_DO.get(env.WORLD_DO.idFromName(REGISTRY_WORLD_ID));
         url.searchParams.set("worldId", REGISTRY_WORLD_ID);
@@ -264,6 +280,10 @@ export class WorldDurableObject {
 
     if (pathname === "/world/chunk") {
       return this.handleChunk(request);
+    }
+
+    if (pathname === "/world/chunks") {
+      return this.handleChunks(request);
     }
 
     if (pathname === "/world/viewport") {
@@ -734,51 +754,53 @@ export class WorldDurableObject {
             safeSend(server, { type: "pong", tick: this.world?.tick ?? 0 });
             return;
           }
-          if (data.type === "set_viewport" && this.world) {
-            const meta = this.clientMeta.get(server) ?? {};
-            const huge = isHugeWorld(this.world.config.size);
-            
-            if (huge) {
-              // Huge world: send chunks for viewport
-              const minCx = data.minCx ?? 0;
-              const minCy = data.minCy ?? 0;
-              const maxCx = data.maxCx ?? minCx + 2;
-              const maxCy = data.maxCy ?? minCy + 2;
-              const lod = (data.lod ?? 0) as 0 | 1 | 2;
-              
-              // Rate limit: max 25 chunks per request
-              const chunkCount = (maxCx - minCx + 1) * (maxCy - minCy + 1);
-              if (chunkCount > 25) {
-                safeSend(server, { type: "error", message: "viewport_too_large" });
-                return;
-              }
-              
-              const chunks: Array<{ cx: number; cy: number; lod: number; data: any }> = [];
-              for (let cy = minCy; cy <= maxCy; cy += 1) {
-                for (let cx = minCx; cx <= maxCx; cx += 1) {
-                  try {
-                    const chunk = generateChunk(this.world.config.seed, cx, cy, lod);
-                    chunks.push({ cx, cy, lod, data: chunk });
-                  } catch (error) {
-                    console.error(`Failed to generate chunk ${cx},${cy}:`, error);
+              if (data.type === "set_viewport" && this.world) {
+                const meta = this.clientMeta.get(server) ?? {};
+                const huge = isHugeWorld(this.world.config.size);
+                
+                if (huge) {
+                  // Huge world: send chunks for viewport
+                  const minCx = data.minCx ?? 0;
+                  const minCy = data.minCy ?? 0;
+                  const maxCx = data.maxCx ?? minCx + 2;
+                  const maxCy = data.maxCy ?? minCy + 2;
+                  const lod = (data.lod ?? 0) as 0 | 1 | 2;
+                  
+                  // Rate limit: max 64 chunks per request
+                  const chunkCount = (maxCx - minCx + 1) * (maxCy - minCy + 1);
+                  if (chunkCount > 64) {
+                    safeSend(server, { type: "error", message: "viewport_too_large", max: 64, requested: chunkCount });
+                    return;
+                  }
+                  
+                  const chunks: Array<{ cx: number; cy: number; lod: number; data: any }> = [];
+                  for (let cy = minCy; cy <= maxCy; cy += 1) {
+                    for (let cx = minCx; cx <= maxCx; cx += 1) {
+                      try {
+                        const chunk = generateChunk(this.world.config.seed, cx, cy, lod);
+                        chunks.push({ cx, cy, lod, data: chunk });
+                      } catch (error) {
+                        console.error(`Failed to generate chunk ${cx},${cy}:`, error);
+                      }
+                    }
+                  }
+                  if (chunks.length > 0) {
+                    safeSend(server, {
+                      type: "viewport_chunks",
+                      chunks,
+                      tick: this.world.tick
+                    });
+                  }
+                } else {
+                  // Small world: use existing subscribe logic
+                  if (data.viewport) {
+                    this.clientMeta.set(server, { ...meta, viewport: data.viewport });
+                    const tiles = tilesForViewport(this.world, data.viewport, meta.agentId);
+                    safeSend(server, { type: "chunk_update", chunks: tiles, tick: this.world.tick });
                   }
                 }
+                return;
               }
-              safeSend(server, {
-                type: "viewport_chunks",
-                chunks,
-                tick: this.world.tick
-              });
-            } else {
-              // Small world: use existing subscribe logic
-              if (data.viewport) {
-                this.clientMeta.set(server, { ...meta, viewport: data.viewport });
-                const tiles = tilesForViewport(this.world, data.viewport, meta.agentId);
-                safeSend(server, { type: "chunk_update", chunks: tiles, tick: this.world.tick });
-              }
-            }
-            return;
-          }
           if (data.type === "subscribe" && data.viewport && this.world && !isHugeWorld(this.world.config.size)) {
             const meta = this.clientMeta.get(server) ?? {};
             this.clientMeta.set(server, { ...meta, viewport: data.viewport });
@@ -1418,6 +1440,61 @@ export class WorldDurableObject {
     }
   }
 
+  private async handleChunks(request: Request): Promise<Response> {
+    if (!this.world) {
+      return this.jsonResponse({ error: "world_not_ready" }, 400);
+    }
+    const url = new URL(request.url);
+    const minCx = Number(url.searchParams.get("minCx"));
+    const minCy = Number(url.searchParams.get("minCy"));
+    const maxCx = Number(url.searchParams.get("maxCx"));
+    const maxCy = Number(url.searchParams.get("maxCy"));
+    const lod = Number(url.searchParams.get("lod") ?? "0") as 0 | 1 | 2;
+    
+    if (isNaN(minCx) || isNaN(minCy) || isNaN(maxCx) || isNaN(maxCy)) {
+      return this.jsonResponse({ error: "invalid_coords" }, 400);
+    }
+    
+    // Limit max chunks per request (e.g. 64 chunks = 8x8)
+    const chunkCount = (maxCx - minCx + 1) * (maxCy - minCy + 1);
+    const MAX_CHUNKS_PER_REQUEST = 64;
+    if (chunkCount > MAX_CHUNKS_PER_REQUEST) {
+      console.warn(`Chunk request too large: ${chunkCount} chunks (max ${MAX_CHUNKS_PER_REQUEST})`);
+      return this.jsonResponse({ 
+        error: "too_many_chunks", 
+        requested: chunkCount, 
+        max: MAX_CHUNKS_PER_REQUEST 
+      }, 400);
+    }
+    
+    try {
+      const chunks: Array<{ cx: number; cy: number; lod: number; data: any }> = [];
+      for (let cy = minCy; cy <= maxCy; cy += 1) {
+        for (let cx = minCx; cx <= maxCx; cx += 1) {
+          const chunk = generateChunk(this.world.config.seed, cx, cy, lod);
+          chunks.push({ cx, cy, lod, data: chunk });
+        }
+      }
+      
+      // Cap total payload size
+      const payload = JSON.stringify({ chunks, count: chunks.length });
+      const bytes = new TextEncoder().encode(payload).length;
+      const MAX_PAYLOAD = 200 * 1024; // 200KB
+      if (bytes > MAX_PAYLOAD) {
+        return this.jsonResponse({ 
+          error: "payload_too_large", 
+          bytes, 
+          max: MAX_PAYLOAD 
+        }, 413);
+      }
+      
+      return this.jsonResponse({ chunks, count: chunks.length, bytes });
+    } catch (error) {
+      console.error("handleChunks error:", error);
+      return this.jsonResponse({ error: "generation_failed", message: String(error) }, 500);
+    }
+  }
+
   private async handleViewport(request: Request): Promise<Response> {
     if (!this.world) {
       return this.jsonResponse({ error: "world_not_ready" }, 400);
@@ -1670,27 +1747,41 @@ export class WorldDurableObject {
       return { type: "error", message: "world_not_ready" };
     }
     
-    // SNAPSHOT CONTRACT: ALWAYS RENDERABLE, NEVER EMPTY
-    // Tiles are derived data, regenerate deterministically if missing
-    const expectedTileCount = this.world.config.size * this.world.config.size;
-    if (!this.world.tiles || this.world.tiles.length !== expectedTileCount) {
-      console.warn(`World tiles missing or wrong size (${this.world.tiles?.length || 0} vs ${expectedTileCount}), regenerating...`);
-      this.world.tiles = getOrGenerateTiles(this.world.config.seed, this.world.config.size);
+    const huge = isHugeWorld(this.world.config.size);
+    
+    // For huge worlds: tiles array is empty, terrain via chunk API
+    // For small worlds: generate tiles if missing
+    if (!huge) {
+      const expectedTileCount = this.world.config.size * this.world.config.size;
+      if (!this.world.tiles || this.world.tiles.length !== expectedTileCount) {
+        console.warn(`World tiles missing or wrong size (${this.world.tiles?.length || 0} vs ${expectedTileCount}), regenerating...`);
+        this.world.tiles = getOrGenerateTiles(this.world.config.seed, this.world.config.size);
+      }
+    } else {
+      // Huge world: ensure tiles array is empty
+      this.world.tiles = [];
     }
     
     // Determine tiles mode: full for size <= 128, chunked for larger
-    const tilesMode: "full" | "chunked" = this.world.config.size <= 128 ? "full" : "chunked";
+    const tilesMode: "full" | "chunked" = huge ? "chunked" : (this.world.config.size <= 128 ? "full" : "chunked");
     const tilesMeta = {
       mode: tilesMode,
       size: this.world.config.size,
-      tileCount: this.world.tiles.length
+      tileCount: huge ? 0 : this.world.tiles.length,
+      chunkSize: CHUNK_SIZE
     };
     
-    // Validate tilesMeta contract
-    if (tilesMeta.mode === "full" && tilesMeta.tileCount !== tilesMeta.size * tilesMeta.size) {
-      console.error(`CRITICAL: tilesMeta contract violation - full mode requires ${tilesMeta.size * tilesMeta.size} tiles, got ${tilesMeta.tileCount}`);
-      this.world.tiles = getOrGenerateTiles(this.world.config.seed, this.world.config.size);
-      tilesMeta.tileCount = this.world.tiles.length;
+    // For huge worlds, provide recommended viewport (center of world, 3x3 chunks)
+    let recommendedViewport: { minCx: number; minCy: number; maxCx: number; maxCy: number } | undefined;
+    if (huge) {
+      const centerCx = Math.floor(this.world.config.size / 2 / CHUNK_SIZE);
+      const centerCy = Math.floor(this.world.config.size / 2 / CHUNK_SIZE);
+      recommendedViewport = {
+        minCx: centerCx - 1,
+        minCy: centerCy - 1,
+        maxCx: centerCx + 1,
+        maxCy: centerCy + 1
+      };
     }
     
     const baseSnapshot = {
@@ -1703,22 +1794,25 @@ export class WorldDurableObject {
       tick: this.world.tick,
       serverTime: Date.now(),
       config: this.world.config,
-      tiles: this.world.tiles,
+      tiles: huge ? [] : this.world.tiles, // Empty for huge worlds
       tilesMeta,
+      recommendedViewport, // For huge worlds, suggest initial chunks to load
       chunkOwnership: this.world.chunkOwnership,
       regions: this.world.regions,
       paused: this.world.paused,
-      tickRate: this.world.config.tickRate
+      tickRate: this.world.config.tickRate,
+      hugeWorld: huge
     };
     
     if (meta?.agentId && this.world.agents[meta.agentId]) {
       const fog = this.world.fog[meta.agentId];
-      const tiles = fog ? filterTilesByFog(this.world, fog) : this.world.tiles;
+      // For huge worlds, tiles array is empty - agent must use chunk API
+      const tiles = huge ? [] : (fog ? filterTilesByFog(this.world, fog) : this.world.tiles);
       const units = fog ? filterUnitsByFog(this.world, fog) : this.world.units;
       return {
         ...baseSnapshot,
         tiles,
-        tilesMeta: { ...tilesMeta, tileCount: tiles.length },
+        tilesMeta: { ...tilesMeta, tileCount: huge ? 0 : tiles.length },
         units,
         cities: this.world.cities,
         states: this.world.states,
@@ -1746,7 +1840,7 @@ export class WorldDurableObject {
         }))
       };
     }
-    // Default case: unauthenticated spectator - still return tiles
+    // Default case: unauthenticated spectator - for huge worlds, tiles array is empty
     return {
       ...baseSnapshot,
       units: {},

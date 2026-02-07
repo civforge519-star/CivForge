@@ -107,6 +107,9 @@ type SnapshotMessage = {
   serverTime: number;
   config: WorldState["config"];
   tiles: Tile[];
+  tilesMeta?: { mode: "full" | "chunked"; size: number; tileCount: number; chunkSize?: number };
+  recommendedViewport?: { minCx: number; minCy: number; maxCx: number; maxCy: number };
+  hugeWorld?: boolean;
   chunkOwnership?: Record<string, { cityId?: string; stateId?: string; contested?: boolean }>;
   regions: WorldState["regions"];
   units: WorldState["units"];
@@ -227,6 +230,77 @@ const App = () => {
   const normalizedTilesRef = useRef<NormalizedTiles | null>(null);
   const lastMapTickRef = useRef<number>(-1);
   const imageSmoothingRef = useRef<boolean>(false);
+  
+  // Chunk cache for huge worlds
+  const chunkCache = useRef<Map<string, { cx: number; cy: number; lod: number; data: any; timestamp: number }>>(new Map());
+  const isHugeWorld = useRef<boolean>(false);
+  const worldChunkSize = useRef<number>(CHUNK_SIZE);
+  const pendingChunkRequests = useRef<Set<string>>(new Set());
+  const lastChunkRequestTime = useRef<number>(0);
+  
+  // Helper to get chunk key
+  const getChunkKey = useCallback((cx: number, cy: number, lod: number) => `${cx},${cy},${lod}`, []);
+  
+  // Fetch chunks for viewport
+  const fetchChunks = useCallback(async (minCx: number, minCy: number, maxCx: number, maxCy: number, lod: number = 0) => {
+    const now = Date.now();
+    // Throttle requests: max 5 requests per second
+    if (now - lastChunkRequestTime.current < 200) {
+      return;
+    }
+    lastChunkRequestTime.current = now;
+    
+    const chunksToFetch: Array<{ cx: number; cy: number }> = [];
+    for (let cy = minCy; cy <= maxCy; cy += 1) {
+      for (let cx = minCx; cx <= maxCx; cx += 1) {
+        const key = getChunkKey(cx, cy, lod);
+        if (!chunkCache.current.has(key) && !pendingChunkRequests.current.has(key)) {
+          chunksToFetch.push({ cx, cy });
+          pendingChunkRequests.current.add(key);
+        }
+      }
+    }
+    
+    if (chunksToFetch.length === 0) {
+      return;
+    }
+    
+    // Limit to 64 chunks per request
+    const limited = chunksToFetch.slice(0, 64);
+    const minCxReq = Math.min(...limited.map(c => c.cx));
+    const minCyReq = Math.min(...limited.map(c => c.cy));
+    const maxCxReq = Math.max(...limited.map(c => c.cx));
+    const maxCyReq = Math.max(...limited.map(c => c.cy));
+    
+    try {
+      const url = new URL(`${HTTP_BASE}/world/chunks`);
+      url.searchParams.set("worldId", worldId);
+      url.searchParams.set("minCx", String(minCxReq));
+      url.searchParams.set("minCy", String(minCyReq));
+      url.searchParams.set("maxCx", String(maxCxReq));
+      url.searchParams.set("maxCy", String(maxCyReq));
+      url.searchParams.set("lod", String(lod));
+      
+      const response = await fetch(url.toString());
+      if (!response.ok) {
+        // Remove from pending on error
+        limited.forEach(c => pendingChunkRequests.current.delete(getChunkKey(c.cx, c.cy, lod)));
+        return;
+      }
+      
+      const data = await response.json() as { chunks: Array<{ cx: number; cy: number; lod: number; data: any }>; count: number };
+      for (const chunk of data.chunks) {
+        const key = getChunkKey(chunk.cx, chunk.cy, chunk.lod);
+        chunkCache.current.set(key, { ...chunk, timestamp: Date.now() });
+        pendingChunkRequests.current.delete(key);
+      }
+      needsRender.current = true;
+    } catch (error) {
+      console.error("Failed to fetch chunks:", error);
+      // Remove from pending on error
+      limited.forEach(c => pendingChunkRequests.current.delete(getChunkKey(c.cx, c.cy, lod)));
+    }
+  }, [HTTP_BASE, worldId, getChunkKey]);
 
   const resolvedWsUrl = useMemo(() => buildWsUrl(WS_URL_RAW), [WS_URL_RAW]);
 
@@ -390,6 +464,8 @@ const App = () => {
           | { type: "border_update"; chunks: Array<{ key: string; tiles: Tile[] }> }
           | { type: "drama_events"; events: DramaEvent[] }
           | { type: "pong" }
+          | { type: "world_info"; worldId: string; seed: string; size: number; chunkSize: number; tickRate: number; hugeWorld: boolean }
+          | { type: "viewport_chunks"; chunks: Array<{ cx: number; cy: number; lod: number; data: any }>; tick: number }
         >(event.data);
         
         // WS Debug tracking
@@ -406,33 +482,53 @@ const App = () => {
         const message = parsed;
         if (message.type === "snapshot") {
           const size = message.config.size;
-          const tiles = new Array<Tile | null>(size * size).fill(null);
-          for (const tile of message.tiles) {
-            tiles[tile.y * size + tile.x] = tile;
+          const huge = message.hugeWorld ?? (message.tilesMeta?.mode === "chunked" ? true : false);
+          isHugeWorld.current = huge;
+          if (message.tilesMeta?.chunkSize) {
+            worldChunkSize.current = message.tilesMeta.chunkSize;
           }
           
-          // Normalize tiles and build map canvas
-          const normalized = normalizeTiles(tiles, size);
-          normalizedTilesRef.current = normalized;
+          // For huge worlds, tiles array is empty - use chunk streaming
+          // For small worlds, use full tiles array
+          const tiles = huge ? [] : new Array<Tile | null>(size * size).fill(null);
+          if (!huge && message.tiles) {
+            for (const tile of message.tiles) {
+              if (tile && tile.x >= 0 && tile.x < size && tile.y >= 0 && tile.y < size) {
+                tiles[tile.y * size + tile.x] = tile;
+              }
+            }
+          }
           
-          // Rebuild map canvas if tick changed or tiles changed
-          if (message.tick !== lastMapTickRef.current || !mapCanvasRef.current || !normalized.tilesOk) {
-            mapCanvasRef.current = buildMapCanvas(
-              size,
-              normalized.biomeGrid,
-              normalized.riverGrid,
-              normalized.contestedGrid,
-              mapCanvasRef.current || undefined
-            );
-            lastMapTickRef.current = message.tick;
+          // For huge worlds, fetch initial chunks if recommended viewport is provided
+          if (huge && message.recommendedViewport) {
+            const { minCx, minCy, maxCx, maxCy } = message.recommendedViewport;
+            fetchChunks(minCx, minCy, maxCx, maxCy, 0);
+          }
+          
+          // Normalize tiles and build map canvas (for small worlds only)
+          if (!huge) {
+            const normalized = normalizeTiles(tiles, size);
+            normalizedTilesRef.current = normalized;
+            
+            // Rebuild map canvas if tick changed or tiles changed
+            if (message.tick !== lastMapTickRef.current || !mapCanvasRef.current || !normalized.tilesOk) {
+              mapCanvasRef.current = buildMapCanvas(
+                size,
+                normalized.biomeGrid,
+                normalized.riverGrid,
+                normalized.contestedGrid,
+                mapCanvasRef.current || undefined
+              );
+              lastMapTickRef.current = message.tick;
+            }
           }
           
           console.log("CivForge snapshot", { 
             tick: message.tick, 
-            tilesCount: message.tiles.length, 
+            tilesCount: huge ? 0 : message.tiles.length, 
             size, 
-            tilesOk: normalized.tilesOk,
-            expectedTiles: normalized.expectedTiles
+            hugeWorld: huge,
+            tilesOk: huge ? "N/A (chunked)" : normalizedTilesRef.current?.tilesOk
           });
           
           setWorld({
@@ -462,6 +558,22 @@ const App = () => {
           setLastUpdate(Date.now());
           lastTickRef.current = message.tick;
           lastSnapshotTime.current = Date.now();
+          needsRender.current = true;
+          return;
+        }
+        if (message.type === "world_info") {
+          // Handle world_info message for huge worlds
+          isHugeWorld.current = message.hugeWorld;
+          worldChunkSize.current = message.chunkSize;
+          return;
+        }
+        if (message.type === "viewport_chunks") {
+          // Handle viewport_chunks message
+          for (const chunk of message.chunks) {
+            const key = getChunkKey(chunk.cx, chunk.cy, chunk.lod);
+            chunkCache.current.set(key, { ...chunk, timestamp: Date.now() });
+            pendingChunkRequests.current.delete(key);
+          }
           needsRender.current = true;
           return;
         }
