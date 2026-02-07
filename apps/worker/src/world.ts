@@ -1,5 +1,6 @@
 import type { Inventory, Position, WorldConfig, WorldState } from "./types";
 import { generateWorldMap, generateRegions } from "./worldgen";
+import { ChunkWorldGenerator, generateWorldTilesFromChunks } from "./chunkgen";
 
 const defaultInventory = (): Inventory => ({
   food: 0,
@@ -37,7 +38,19 @@ export const createWorld = (
   };
   const mergedConfig = { ...config, ...overrides };
 
-  const tiles = generateWorldMap(mergedConfig.seed, mergedConfig.size);
+  // Use chunk-based generation for new worlds (backward compatible)
+  // For small worlds (< 256), use old system for compatibility
+  // For larger worlds, use chunk-based system
+  let tiles: WorldState["tiles"];
+  if (mergedConfig.size <= 256) {
+    // Small world: use legacy generation for backward compatibility
+    tiles = generateWorldMap(mergedConfig.seed, mergedConfig.size);
+  } else {
+    // Large world: use chunk-based generation
+    const generator = new ChunkWorldGenerator(mergedConfig.seed, 100);
+    tiles = generateWorldTilesFromChunks(generator, mergedConfig.size);
+  }
+  
   const regions = generateRegions(tiles, mergedConfig.size);
 
   return {

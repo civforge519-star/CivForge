@@ -9,6 +9,45 @@ export type Biome =
   | "mountain"
   | "river";
 
+// Biome ID enum for compact payloads
+export enum BiomeId {
+  OCEAN = 0,
+  COAST = 1,
+  PLAINS = 2,
+  FOREST = 3,
+  DESERT = 4,
+  TUNDRA = 5,
+  SNOW = 6,
+  MOUNTAIN = 7,
+  RIVER = 8
+}
+
+// Biome string to ID mapping
+export const BIOME_TO_ID: Record<Biome, BiomeId> = {
+  ocean: BiomeId.OCEAN,
+  coast: BiomeId.COAST,
+  plains: BiomeId.PLAINS,
+  forest: BiomeId.FOREST,
+  desert: BiomeId.DESERT,
+  tundra: BiomeId.TUNDRA,
+  snow: BiomeId.SNOW,
+  mountain: BiomeId.MOUNTAIN,
+  river: BiomeId.RIVER
+};
+
+// Biome ID to string mapping
+export const ID_TO_BIOME: Record<BiomeId, Biome> = {
+  [BiomeId.OCEAN]: "ocean",
+  [BiomeId.COAST]: "coast",
+  [BiomeId.PLAINS]: "plains",
+  [BiomeId.FOREST]: "forest",
+  [BiomeId.DESERT]: "desert",
+  [BiomeId.TUNDRA]: "tundra",
+  [BiomeId.SNOW]: "snow",
+  [BiomeId.MOUNTAIN]: "mountain",
+  [BiomeId.RIVER]: "river"
+};
+
 export type Position = {
   x: number;
   y: number;
