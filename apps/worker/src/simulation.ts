@@ -21,12 +21,16 @@ export const tickWorld = (state: WorldState): { processed: Action[]; rejected: A
     return { processed: [], rejected: [] };
   }
 
-  // CRITICAL: Ensure tiles exist before ticking
-  const expectedTileCount = state.config.size * state.config.size;
-  if (!state.tiles || state.tiles.length !== expectedTileCount) {
-    console.error(`CRITICAL: World tiles missing before tick (${state.tiles?.length || 0} vs ${expectedTileCount})`);
-    // This should not happen if initialization worked, but fail safely
-    throw new Error(`World tiles missing: ${state.tiles?.length || 0} vs expected ${expectedTileCount}`);
+  // CRITICAL: For huge worlds, tiles array is empty - simulation uses chunk sampling
+  // For small/medium worlds, ensure tiles exist
+  const huge = state.config.size >= 512;
+  if (!huge) {
+    const expectedTileCount = state.config.size * state.config.size;
+    if (!state.tiles || state.tiles.length !== expectedTileCount) {
+      console.error(`CRITICAL: World tiles missing before tick (${state.tiles?.length || 0} vs ${expectedTileCount})`);
+      // This should not happen if initialization worked, but fail safely
+      throw new Error(`World tiles missing: ${state.tiles?.length || 0} vs expected ${expectedTileCount}`);
+    }
   }
 
   state.tick += 1;

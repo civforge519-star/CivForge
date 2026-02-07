@@ -1,4 +1,5 @@
-import type { WorldState } from "../types";
+import type { WorldState, WorldConfig } from "../types";
+import { isHugeWorld } from "../world";
 
 type StorageState = DurableObjectState["storage"];
 type SqlStorage = DurableObjectState["storage"]["sql"];
@@ -62,9 +63,15 @@ const checkPayloadSize = (data: string, operation: string): void => {
 export const saveWorldState = async (state: DurableObjectState, world: WorldState): Promise<void> => {
   try {
     // Tiles are derived data, do not persist - always exclude from save
+    // For huge worlds, tiles array is empty anyway, but ensure it's never persisted
     const data = JSON.stringify({ ...world, tiles: [] });
     checkPayloadSize(data, "saveWorldState");
     exec(state.storage.sql, "INSERT OR REPLACE INTO world_state (id, data) VALUES (1, ?)", data);
+    
+    // Log once per cold start for huge worlds
+    if (isHugeWorld(world.config)) {
+      console.log(`Huge world mode (size=${world.config.size}): terrain is generated on-demand, not persisted`);
+    }
   } catch (error) {
     console.error("saveWorldState error:", error);
     // Don't throw - allow world to continue in memory
