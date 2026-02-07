@@ -171,27 +171,115 @@ export class ChunkWorldGenerator {
 
   /**
    * Sample field values at world coordinates
+   * Uses layered noise for natural terrain with one large landmass + islands
    */
   sampleFields(x: number, y: number): FieldValues {
-    // Elevation: continent-scale + detail
-    const continentElevation = this.noise.sample(x * 0.01, y * 0.01, 4, 0.5);
-    const detailElevation = this.noise.sample(x * 0.1, y * 0.1, 3, 1.0) * 0.3;
-    const elevation = continentElevation * 0.7 + detailElevation;
-
-    // Temperature: latitude-based with noise
-    const latitude = Math.abs(y / 10000 - 0.5) * 2; // Normalize for large maps
-    const tempNoise = this.noise.sample(x * 0.05, y * 0.05, 2, 1.0) * 0.2;
-    const temperature = 1 - latitude + tempNoise;
-
-    // Moisture: noise-based, boosted near water
-    const baseMoisture = this.noise.sample(x * 0.08, y * 0.08, 4, 1.0);
-    const waterBoost = elevation < SEA_LEVEL + 0.1 ? 0.3 : 0;
-    const moisture = Math.min(1, baseMoisture + waterBoost);
-
-    // Ruggedness: high-frequency noise for mountain detail
-    const ruggedness = this.noise.sample(x * 0.2, y * 0.2, 2, 2.0);
-
-    return { elevation, temperature, moisture, ruggedness };
+    const size = 128; // World size (normalize coordinates)
+    const nx = x / size;
+    const ny = y / size;
+    
+    // Create one large central landmass using radial falloff
+    const centerX = 0.5;
+    const centerY = 0.5;
+    const distFromCenter = Math.sqrt((nx - centerX) ** 2 + (ny - centerY) ** 2);
+    const landmassShape = 1 - (distFromCenter * 1.8); // Large central continent
+    const landmassNoise = this.noise.sample(x * 0.008, y * 0.008, 4, 1.2);
+    const continentBase = Math.max(0, landmassShape * 0.7 + landmassNoise * 0.3);
+    
+    // Add scattered islands (smaller landmasses away from center)
+    const islandNoise = this.noise.sample(x * 0.015, y * 0.015, 3, 0.8);
+    const islandThreshold = 0.3;
+    const islandContribution = islandNoise > islandThreshold ? (islandNoise - islandThreshold) * 0.4 : 0;
+    
+    // Mid-frequency terrain detail (mountains, valleys)
+    const terrainNoise = this.noise.sample(x * 0.04, y * 0.04, 5, 0.6);
+    
+    // High-frequency detail (small features)
+    const detailNoise = this.noise.sample(x * 0.15, y * 0.15, 2, 0.2);
+    
+    // Combine for elevation: continent base + islands + terrain detail
+    const elevation = Math.max(0, Math.min(1, 
+      continentBase * 0.5 + 
+      islandContribution * 0.3 + 
+      terrainNoise * 0.15 + 
+      detailNoise * 0.05
+    ));
+    
+    // Temperature: latitude-based with elevation influence
+    const lat = ny; // 0-1 from top to bottom
+    const tempBase = 1 - Math.abs(lat - 0.5) * 1.8; // Colder at poles, warmer at equator
+    const tempElevation = (1 - elevation) * 0.4; // Higher = colder
+    const tempNoise = this.noise.sample(x * 0.02, y * 0.02, 2, 0.3);
+    const temperature = Math.max(0, Math.min(1, tempBase * 0.6 + tempElevation + tempNoise * 0.15));
+    
+    // Moisture: distance from coast + elevation (rain shadow) + noise
+    const coastDist = this.getCoastDistance(x, y);
+    const moistureBase = Math.max(0, 1 - coastDist * 1.5);
+    
+    // Rain shadow: leeward side of mountains is drier
+    const mountainInfluence = elevation > 0.6 ? this.getRainShadow(x, y, elevation) : 1.0;
+    
+    const moistureNoise = this.noise.sample(x * 0.03, y * 0.03, 3, 0.5);
+    const moisture = Math.max(0, Math.min(1, 
+      moistureBase * 0.5 + 
+      mountainInfluence * 0.3 + 
+      moistureNoise * 0.2
+    ));
+    
+    // Ruggedness: high-frequency noise for mountain detail, concentrated in high elevation
+    const ruggednessBase = elevation > 0.5 ? this.noise.sample(x * 0.12, y * 0.12, 4, 1.5) : 0.2;
+    const ruggedness = Math.max(0, Math.min(1, ruggednessBase * elevation));
+    
+    return {
+      elevation: Math.max(0, Math.min(1, elevation)),
+      temperature: Math.max(0, Math.min(1, temperature)),
+      moisture: Math.max(0, Math.min(1, moisture)),
+      ruggedness: Math.max(0, Math.min(1, ruggedness))
+    };
+  }
+  
+  /**
+   * Calculate distance to nearest coast (for moisture calculation)
+   */
+  private getCoastDistance(x: number, y: number): number {
+    // Sample nearby points to find coast
+    const searchRadius = 10;
+    let minDist = searchRadius;
+    
+    for (let dy = -searchRadius; dy <= searchRadius; dy += 2) {
+      for (let dx = -searchRadius; dx <= searchRadius; dx += 2) {
+        const fields = this.sampleFields(x + dx, y + dy);
+        if (fields.elevation < COAST_THRESHOLD) {
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          minDist = Math.min(minDist, dist);
+        }
+      }
+    }
+    
+    return minDist / searchRadius; // Normalize to 0-1
+  }
+  
+  /**
+   * Calculate rain shadow effect (drier on leeward side of mountains)
+   */
+  private getRainShadow(x: number, y: number, elevation: number): number {
+    if (elevation < 0.5) return 1.0; // No rain shadow at low elevation
+    
+    // Check windward side (assume prevailing wind from west)
+    const westElevation = this.sampleFields(x - 10, y).elevation;
+    const eastElevation = this.sampleFields(x + 10, y).elevation;
+    
+    // If we're on the leeward (east) side of a mountain, reduce moisture
+    if (westElevation > elevation + 0.1 && eastElevation < elevation) {
+      return 0.3; // Strong rain shadow
+    }
+    
+    // If we're on the windward (west) side, increase moisture
+    if (westElevation < elevation && eastElevation > elevation + 0.1) {
+      return 1.2; // Enhanced moisture (capped by caller)
+    }
+    
+    return 1.0; // No rain shadow
   }
 
   /**
@@ -218,47 +306,67 @@ export class ChunkWorldGenerator {
 
   /**
    * Classify biome from field values
-   * Smooth transitions, not grid-like
+   * Natural biome placement with smooth transitions
    */
   private classifyBiome(fields: FieldValues): Biome {
     const { elevation, temperature, moisture, ruggedness } = fields;
 
-    // Ocean
+    // Ocean (below sea level)
     if (elevation < SEA_LEVEL) {
       return "ocean";
     }
 
-    // Coast
+    // Coast (shallow water, beaches, estuaries)
     if (elevation < COAST_THRESHOLD) {
+      // Wetlands/estuaries in low-lying coastal areas with high moisture
+      if (moisture > 0.7 && elevation < SEA_LEVEL + 0.02) {
+        return "coast"; // Marshy coast
+      }
       return "coast";
     }
 
     // Mountains (high elevation + high ruggedness)
-    if (elevation > 0.75 && ruggedness > 0.6) {
-      return temperature < 0.3 ? "snow" : "mountain";
+    // Snow caps on high mountains (cold or very high)
+    if (elevation > 0.7 && ruggedness > 0.5) {
+      if (temperature < 0.35 || elevation > 0.85) {
+        return "snow"; // Snow-capped peaks
+      }
+      return "mountain";
     }
 
-    // Tundra (very cold)
-    if (temperature < 0.25) {
-      return moisture > 0.5 ? "tundra" : "snow";
+    // Tundra (very cold, moderate moisture)
+    if (temperature < 0.3) {
+      if (moisture > 0.4) {
+        return "tundra";
+      }
+      return "snow"; // Cold and dry = snow
     }
 
-    // Desert (very dry)
-    if (moisture < 0.2) {
+    // High elevation but not quite mountain = alpine tundra
+    if (elevation > 0.65 && temperature < 0.5) {
+      return "tundra";
+    }
+
+    // Desert (very dry, especially on leeward side of mountains)
+    // Desert forms in dry zones, especially at mid-low elevations
+    if (moisture < 0.25 && elevation < 0.7) {
       return "desert";
     }
 
-    // Swamp (high moisture, moderate temp)
-    if (moisture > 0.7 && temperature > 0.4 && temperature < 0.7 && elevation < 0.5) {
-      return "plains"; // Use plains as swamp proxy for now
+    // Forest (high moisture, moderate to high temperature, mid elevations)
+    // Forests prefer humid zones near rivers and moderate elevations
+    if (moisture > 0.55 && temperature > 0.35 && elevation < 0.7) {
+      // Denser forest in very humid zones
+      if (moisture > 0.7) {
+        return "forest";
+      }
+      // Mixed forest/plains transition
+      if (moisture > 0.6) {
+        return "forest";
+      }
     }
 
-    // Forest (high moisture)
-    if (moisture > 0.6) {
-      return "forest";
-    }
-
-    // Default: plains/grassland
+    // Default: plains/grassland (moderate conditions)
     return "plains";
   }
 
@@ -335,39 +443,134 @@ export class ChunkWorldGenerator {
   /**
    * Check if a point is on a river path by tracing from nearby sources
    * Uses deterministic downhill walk with safeguards
+   * Improved: Better river continuity and branching
    */
   private isOnRiverPath(x: number, y: number, fields: FieldValues): boolean {
-    const MAX_TRACE_STEPS = 200;
+    const MAX_TRACE_STEPS = 300; // Increased for longer rivers
     const visited = new Set<string>();
     let currentX = x;
     let currentY = y;
     let steps = 0;
+    let foundSource = false;
 
-    // Trace backward/forward along elevation gradient
+    // Trace backward (uphill) to find source
     while (steps < MAX_TRACE_STEPS) {
       const key = `${currentX},${currentY}`;
       if (visited.has(key)) {
-        // Loop detected - create lake or terminate
-        return false;
+        // Loop detected - check if we're in a valid river basin
+        break;
       }
       visited.add(key);
 
       const currentFields = this.sampleFields(currentX, currentY);
       
-      // Check if we've reached a source
-      if (currentFields.elevation > 0.65 && currentFields.moisture > 0.6) {
-        const sourceSeed = this.noise.sample(currentX * 0.1, currentY * 0.1, 1, 0.5);
-        if (sourceSeed > 0.85) {
-          return true; // This point is on a valid river path
+      // Check if we've reached a valid source
+      if (currentFields.elevation > 0.6 && currentFields.moisture > 0.55) {
+        const sourceSeed = this.noise.sample(currentX * 0.08, currentY * 0.08, 1, 0.6);
+        if (sourceSeed > 0.75) {
+          foundSource = true;
+          break; // Found valid source
         }
       }
 
-      // Check if we've reached ocean/coast (river endpoint)
-      if (currentFields.elevation < SEA_LEVEL + 0.1) {
-        return false; // River ended, but this point wasn't on the path
+      // Check if we've reached ocean/coast (can't trace further)
+      if (currentFields.elevation < SEA_LEVEL + 0.05) {
+        break; // Reached water, not a valid path
       }
 
-      // Find lowest neighbor (downhill direction)
+      // Find highest neighbor (uphill direction, tracing backward)
+      const neighbors = [
+        { x: currentX - 1, y: currentY },
+        { x: currentX + 1, y: currentY },
+        { x: currentX, y: currentY - 1 },
+        { x: currentX, y: currentY + 1 },
+        // Include diagonals for smoother paths
+        { x: currentX - 1, y: currentY - 1 },
+        { x: currentX + 1, y: currentY - 1 },
+        { x: currentX - 1, y: currentY + 1 },
+        { x: currentX + 1, y: currentY + 1 }
+      ];
+
+      let next: { x: number; y: number } | null = null;
+      let highestElevation = currentFields.elevation;
+
+      for (const n of neighbors) {
+        const nFields = this.sampleFields(n.x, n.y);
+        // Prefer neighbors that are higher (uphill) but not too much higher (avoid jumping)
+        if (nFields.elevation > highestElevation && nFields.elevation < currentFields.elevation + 0.2) {
+          highestElevation = nFields.elevation;
+          next = n;
+        }
+      }
+
+      // No uphill neighbor found - check if we're in a valid river valley
+      if (!next) {
+        // If we're in a valley (surrounded by higher ground) and have moisture, might be river
+        if (currentFields.moisture > 0.6 && currentFields.elevation > SEA_LEVEL + 0.1) {
+          // Check if nearby cells suggest river flow
+          const nearbyMoisture = this.checkNearbyMoisture(currentX, currentY);
+          if (nearbyMoisture > 0.65) {
+            foundSource = true; // Valid river valley
+          }
+        }
+        break;
+      }
+
+      currentX = next.x;
+      currentY = next.y;
+      steps += 1;
+    }
+
+    // If we found a source, verify the path forward (downhill) is valid
+    if (foundSource) {
+      // Quick forward trace to ensure river flows to water
+      return this.verifyRiverFlow(x, y, fields);
+    }
+
+    return false;
+  }
+  
+  /**
+   * Check nearby moisture to determine if we're in a river valley
+   */
+  private checkNearbyMoisture(x: number, y: number): number {
+    let totalMoisture = 0;
+    let count = 0;
+    for (let dy = -2; dy <= 2; dy += 1) {
+      for (let dx = -2; dx <= 2; dx += 1) {
+        const fields = this.sampleFields(x + dx, y + dy);
+        totalMoisture += fields.moisture;
+        count += 1;
+      }
+    }
+    return totalMoisture / count;
+  }
+  
+  /**
+   * Verify that a river point can flow downhill to water
+   */
+  private verifyRiverFlow(x: number, y: number, fields: FieldValues): boolean {
+    const MAX_FLOW_STEPS = 150;
+    let currentX = x;
+    let currentY = y;
+    let steps = 0;
+    const visited = new Set<string>();
+
+    while (steps < MAX_FLOW_STEPS) {
+      const key = `${currentX},${currentY}`;
+      if (visited.has(key)) {
+        break; // Loop
+      }
+      visited.add(key);
+
+      const currentFields = this.sampleFields(currentX, currentY);
+      
+      // Reached water - valid river
+      if (currentFields.elevation < SEA_LEVEL + 0.1) {
+        return true;
+      }
+
+      // Find lowest neighbor (downhill)
       const neighbors = [
         { x: currentX - 1, y: currentY },
         { x: currentX + 1, y: currentY },
@@ -386,16 +589,12 @@ export class ChunkWorldGenerator {
         }
       }
 
-      // Local minima: no downhill neighbor
       if (!next) {
-        // Check if this is a lake basin (deterministic)
+        // Local minima - check for lake
         if (currentFields.moisture > 0.7) {
-          const lakeSeed = this.noise.sample(currentX * 0.2, currentY * 0.2, 1, 2.0);
-          if (lakeSeed > 0.75) {
-            return false; // Lake formed, river ends
-          }
+          return true; // Lake formed, river valid
         }
-        return false; // Local minima, river terminates
+        return false; // Dead end
       }
 
       currentX = next.x;
@@ -403,17 +602,38 @@ export class ChunkWorldGenerator {
       steps += 1;
     }
 
-    return false; // Max steps reached
+    return false; // Didn't reach water
   }
 
   /**
    * Check if cell has a lake
+   * Lakes form in local elevation minima with high moisture
    */
   private checkLake(x: number, y: number, fields: FieldValues): boolean {
-    // Lakes in local minima with high moisture
-    if (fields.elevation < 0.4 && fields.moisture > 0.7) {
-      const lakeNoise = this.noise.sample(x * 0.2, y * 0.2, 1, 2.0);
-      return lakeNoise > 0.75;
+    // Lakes need to be in a basin (local minimum) with sufficient moisture
+    if (fields.elevation < 0.5 && fields.moisture > 0.65) {
+      // Check if this is a local minimum (all neighbors are higher)
+      const neighbors = [
+        { x: x - 1, y },
+        { x: x + 1, y },
+        { x, y: y - 1 },
+        { x, y: y + 1 }
+      ];
+      
+      let isLocalMin = true;
+      for (const n of neighbors) {
+        const nFields = this.sampleFields(n.x, n.y);
+        if (nFields.elevation < fields.elevation + 0.05) {
+          isLocalMin = false;
+          break;
+        }
+      }
+      
+      if (isLocalMin) {
+        // Use deterministic noise to place lakes
+        const lakeNoise = this.noise.sample(x * 0.15, y * 0.15, 1, 1.5);
+        return lakeNoise > 0.7; // 30% chance in valid basins
+      }
     }
     return false;
   }

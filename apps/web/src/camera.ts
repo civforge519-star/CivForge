@@ -75,16 +75,14 @@ export const resetToFit = (
   camera.x = worldSize / 2;
   camera.y = worldSize / 2;
   
-  // Calculate zoom to fit entire world in view
-  // World coordinates: 0 to worldSize
-  // We want to see the full world with a small margin
-  const padding = 0.95; // 95% of viewport to leave small margin
+  // Calculate zoom to fit entire world in view with 5% padding
+  const padding = 0.95; // 95% of viewport (5% margin)
   const zoomX = (canvasWidth * padding) / worldSize;
   const zoomY = (canvasHeight * padding) / worldSize;
   camera.zoom = Math.min(zoomX, zoomY);
   
-  // Ensure zoom is reasonable (not too small or too large)
-  camera.zoom = Math.max(0.1, Math.min(camera.zoom, 5.0));
+  // Clamp zoom between 0.1 and 20
+  camera.zoom = Math.max(0.1, Math.min(camera.zoom, 20.0));
   
   // Reset velocity
   camera.vx = 0;

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { buildHttpBase, buildWsUrl, safeParseJson } from "./net";
 import { createCamera, screenToWorld, updateCamera, worldToScreen, clamp, resetToFit } from "./camera";
-import { drawBorders, drawFog, drawOverlay, getChunkCanvas, drawCheckerboard, drawTilesInViewport } from "./renderer";
+import { drawBorders, drawFog, drawOverlay, drawCheckerboard, normalizeTiles, buildMapCanvas, drawMapCanvas, type NormalizedTiles } from "./renderer";
 
 type Biome =
   | "ocean"
@@ -209,7 +209,6 @@ const App = () => {
   const WS_URL_RAW = import.meta.env.VITE_WS_URL ?? "ws://127.0.0.1:8787/ws";
   const buildId = import.meta.env.VITE_BUILD_ID ?? "dev";
   const reconnectAttempts = useRef(0);
-  const chunkCache = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const camera = useRef(createCamera());
   const wsRef = useRef<WebSocket | null>(null);
   const lastViewport = useRef<string>("");
@@ -222,6 +221,12 @@ const App = () => {
   const lastSnapshotTime = useRef<number | null>(null);
   const hasFittedCamera = useRef(false);
   const lastTickRef = useRef(0);
+  
+  // Cached map canvas and normalized tiles
+  const mapCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const normalizedTilesRef = useRef<NormalizedTiles | null>(null);
+  const lastMapTickRef = useRef<number>(-1);
+  const imageSmoothingRef = useRef<boolean>(false);
 
   const resolvedWsUrl = useMemo(() => buildWsUrl(WS_URL_RAW), [WS_URL_RAW]);
 
@@ -308,10 +313,36 @@ const App = () => {
           tiles[tile.y * size + tile.x] = tile;
         }
       }
+      
+      // Normalize tiles and build map canvas
+      const normalized = normalizeTiles(tiles, size);
+      normalizedTilesRef.current = normalized;
+      
+      // Rebuild map canvas if tick changed or tiles changed
+      if (data.tick !== lastMapTickRef.current || !mapCanvasRef.current || !normalized.tilesOk) {
+        mapCanvasRef.current = buildMapCanvas(
+          size,
+          normalized.biomeGrid,
+          normalized.riverGrid,
+          normalized.contestedGrid,
+          mapCanvasRef.current || undefined
+        );
+        lastMapTickRef.current = data.tick;
+      }
+      
+      console.log("CivForge snapshot", { 
+        tick: data.tick, 
+        tilesCount: data.tiles?.length || 0, 
+        size, 
+        tilesOk: normalized.tilesOk,
+        expectedTiles: normalized.expectedTiles
+      });
+      
       setWorld({ ...data, tiles, chunkOwnership: data.chunkOwnership });
       needsRender.current = true;
       setEvents(data.events ?? []);
       setSpeed(data.config?.tickRate ?? 1);
+      lastSnapshotTime.current = Date.now();
     } catch (error) {
       console.error("Failed to fetch snapshot", error);
     }
@@ -379,6 +410,31 @@ const App = () => {
           for (const tile of message.tiles) {
             tiles[tile.y * size + tile.x] = tile;
           }
+          
+          // Normalize tiles and build map canvas
+          const normalized = normalizeTiles(tiles, size);
+          normalizedTilesRef.current = normalized;
+          
+          // Rebuild map canvas if tick changed or tiles changed
+          if (message.tick !== lastMapTickRef.current || !mapCanvasRef.current || !normalized.tilesOk) {
+            mapCanvasRef.current = buildMapCanvas(
+              size,
+              normalized.biomeGrid,
+              normalized.riverGrid,
+              normalized.contestedGrid,
+              mapCanvasRef.current || undefined
+            );
+            lastMapTickRef.current = message.tick;
+          }
+          
+          console.log("CivForge snapshot", { 
+            tick: message.tick, 
+            tilesCount: message.tiles.length, 
+            size, 
+            tilesOk: normalized.tilesOk,
+            expectedTiles: normalized.expectedTiles
+          });
+          
           setWorld({
             worldId: message.worldId,
             type: message.worldType,
@@ -405,6 +461,7 @@ const App = () => {
           setSpeed(message.tickRate ?? 1);
           setLastUpdate(Date.now());
           lastTickRef.current = message.tick;
+          lastSnapshotTime.current = Date.now();
           needsRender.current = true;
           return;
         }
@@ -562,7 +619,6 @@ const App = () => {
     if (!world || !canvasRef.current) {
       return;
     }
-    chunkCache.current.clear();
     
     // Auto-fit camera on first world load - ensure it happens after canvas is sized
     const fitCamera = () => {
@@ -902,20 +958,36 @@ const App = () => {
       );
     }
 
-    // Render tiles directly with proper viewport culling
-    const startChunkX = Math.floor(view.left / CHUNK_SIZE);
-    const startChunkY = Math.floor(view.top / CHUNK_SIZE);
-    const endChunkX = Math.floor(view.right / CHUNK_SIZE);
-    const endChunkY = Math.floor(view.bottom / CHUNK_SIZE);
-    
+    // Render using cached map canvas
+    const normalized = normalizedTilesRef.current;
+    const mapCanvas = mapCanvasRef.current;
+    let renderMode = "fallback";
     let tilesRendered = 0;
-    let chunksRendered = 0;
     
-    if (world.tiles && world.tiles.length > 0) {
-      // Use direct tile rendering for better performance and correctness
-      const result = drawTilesInViewport(ctx, world, view, cam.zoom, biomeColors);
-      tilesRendered = result.tilesRendered;
-      chunksRendered = (endChunkX - startChunkX + 1) * (endChunkY - startChunkY + 1);
+    if (mapCanvas && normalized && normalized.tilesOk) {
+      // Use cached map canvas for fast rendering
+      renderMode = "mapCanvas";
+      
+      // Determine image smoothing based on zoom
+      const shouldSmooth = cam.zoom < 2.0;
+      if (shouldSmooth !== imageSmoothingRef.current) {
+        imageSmoothingRef.current = shouldSmooth;
+      }
+      
+      drawMapCanvas(
+        ctx,
+        mapCanvas,
+        cam,
+        world.config.size,
+        width,
+        height,
+        imageSmoothingRef.current
+      );
+      
+      // Calculate tiles rendered (approximate from viewport)
+      const viewWidth = view.right - view.left;
+      const viewHeight = view.bottom - view.top;
+      tilesRendered = Math.floor(viewWidth * viewHeight);
     } else {
       // Fallback: draw checkerboard if tiles missing
       drawCheckerboard(ctx, width, height, 32);
@@ -1054,19 +1126,24 @@ const App = () => {
     
     // Update debug object
     if (typeof window !== "undefined") {
+      const normalized = normalizedTilesRef.current;
       (window as any).__CIVFORGE_DEBUG__ = {
         world: { worldId: world.worldId, tick: world.tick, size: world.config.size },
         tilesCount: world.tiles?.length || 0,
+        expectedTiles: normalized?.expectedTiles || world.config.size * world.config.size,
+        tilesOk: normalized?.tilesOk || false,
         tilesRendered: tilesRendered,
-        chunksRendered: chunksRendered,
-        visibleChunkRange: {
-          start: { x: startChunkX, y: startChunkY },
-          end: { x: endChunkX, y: endChunkY }
-        },
+        renderMode: renderMode,
+        lastSnapshotTick: lastMapTickRef.current,
         agentsCount: Object.keys(world.units || {}).length,
         camera: { x: cam.x, y: cam.y, zoom: cam.zoom },
         viewport: { left: view.left, top: view.top, right: view.right, bottom: view.bottom },
         zoom: cam.zoom,
+        cameraX: cam.x,
+        cameraY: cam.y,
+        canvasW: width,
+        canvasH: height,
+        imageSmoothingEnabled: imageSmoothingRef.current,
         lastSnapshot: lastSnapshotTime.current,
         lastRenderError: lastRenderError.current,
         canvasSize: { width, height },
@@ -1128,7 +1205,7 @@ const App = () => {
       const [a, b] = Array.from(pointers.current.values());
       const distance = Math.hypot(a.x - b.x, a.y - b.y);
       const scale = distance / pinchState.current.distance;
-      cam.zoom = clamp(pinchState.current.zoom * scale, 0.3, 4);
+      cam.zoom = clamp(pinchState.current.zoom * scale, 0.1, 20);
       return;
     }
     if (cam.isDragging) {
@@ -1136,10 +1213,9 @@ const App = () => {
       const dy = event.clientY - cam.lastY;
       cam.lastX = event.clientX;
       cam.lastY = event.clientY;
-      cam.vx = -dx / cam.zoom / 6;
-      cam.vy = -dy / cam.zoom / 6;
-      cam.x += -dx / cam.zoom;
-      cam.y += -dy / cam.zoom;
+      // Pan: move camera opposite to drag direction
+      cam.x -= dx / cam.zoom;
+      cam.y -= dy / cam.zoom;
       needsRender.current = true;
     }
     if (canvasRef.current && world) {
@@ -1164,11 +1240,33 @@ const App = () => {
 
   const handleWheel = useCallback((event: WheelEvent) => {
     event.preventDefault();
+    const canvas = canvasRef.current;
+    if (!canvas || !world) return;
+    
     const cam = camera.current;
+    const rect = canvas.getBoundingClientRect();
+    
+    // Get cursor position in screen coordinates
+    const cursorX = event.clientX - rect.left;
+    const cursorY = event.clientY - rect.top;
+    
+    // Convert cursor to world coordinates before zoom
+    const worldBefore = screenToWorld(cursorX, cursorY, cam, world.config.size, rect);
+    
+    // Apply zoom
     const delta = -event.deltaY * 0.001;
-    cam.zoom = clamp(cam.zoom + delta, 0.3, 4);
+    const oldZoom = cam.zoom;
+    cam.zoom = clamp(cam.zoom + delta, 0.1, 20);
+    
+    // Convert cursor to world coordinates after zoom
+    const worldAfter = screenToWorld(cursorX, cursorY, cam, world.config.size, rect);
+    
+    // Adjust camera so the world point under cursor stays fixed
+    cam.x += worldBefore.x - worldAfter.x;
+    cam.y += worldBefore.y - worldAfter.y;
+    
     needsRender.current = true;
-  }, []);
+  }, [world]);
 
   // Native wheel event listener with passive: false for preventDefault
   useEffect(() => {
@@ -1284,11 +1382,13 @@ const App = () => {
               <div>Tiles: {world?.tiles?.length || 0} {world?.tiles?.length ? "✓" : "✗"}</div>
               {typeof window !== "undefined" && (window as any).__CIVFORGE_DEBUG__ && (
                 <>
+                  <div>Expected Tiles: {(window as any).__CIVFORGE_DEBUG__.expectedTiles || 0}</div>
+                  <div>Tiles OK: {(window as any).__CIVFORGE_DEBUG__.tilesOk ? "✓" : "✗"}</div>
+                  <div>Render Mode: {(window as any).__CIVFORGE_DEBUG__.renderMode || "unknown"}</div>
+                  <div>Last Snapshot Tick: {(window as any).__CIVFORGE_DEBUG__.lastSnapshotTick ?? "N/A"}</div>
                   <div>Tiles Rendered: {(window as any).__CIVFORGE_DEBUG__.tilesRendered || 0}</div>
-                  <div>Chunks Rendered: {(window as any).__CIVFORGE_DEBUG__.chunksRendered || 0}</div>
-                  {(window as any).__CIVFORGE_DEBUG__.visibleChunkRange && (
-                    <div>Chunk Range: ({Math.floor((window as any).__CIVFORGE_DEBUG__.visibleChunkRange.start.x)}, {Math.floor((window as any).__CIVFORGE_DEBUG__.visibleChunkRange.start.y)}) to ({Math.floor((window as any).__CIVFORGE_DEBUG__.visibleChunkRange.end.x)}, {Math.floor((window as any).__CIVFORGE_DEBUG__.visibleChunkRange.end.y)})</div>
-                  )}
+                  <div>Canvas: {(window as any).__CIVFORGE_DEBUG__.canvasW || 0}×{(window as any).__CIVFORGE_DEBUG__.canvasH || 0}</div>
+                  <div>Image Smoothing: {(window as any).__CIVFORGE_DEBUG__.imageSmoothingEnabled ? "ON" : "OFF"}</div>
                   {(window as any).__CIVFORGE_DEBUG__.viewport && (
                     <div>Viewport: ({Math.floor((window as any).__CIVFORGE_DEBUG__.viewport.left)}, {Math.floor((window as any).__CIVFORGE_DEBUG__.viewport.top)}) to ({Math.floor((window as any).__CIVFORGE_DEBUG__.viewport.right)}, {Math.floor((window as any).__CIVFORGE_DEBUG__.viewport.bottom)})</div>
                   )}

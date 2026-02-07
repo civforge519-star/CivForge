@@ -13,101 +13,222 @@ export const shadeColor = (color: string, percent: number) => {
 };
 
 /**
- * Render tiles directly to main canvas using proper world-to-screen transforms
- * This replaces chunk canvas approach for better viewport culling
+ * Biome to RGB color mapping
+ * Natural, distinct colors for clean game map style
  */
-export const drawTilesInViewport = (
-  ctx: CanvasRenderingContext2D,
-  worldState: { config: { size: number }; tiles: Array<any | null> },
-  view: { left: number; top: number; right: number; bottom: number },
-  zoom: number,
-  biomeColors: Record<string, string>
-): { tilesRendered: number } => {
-  let tilesRendered = 0;
+const biomeRGB: Record<string, [number, number, number]> = {
+  ocean: [15, 60, 130],        // Deep ocean blue
+  coast: [50, 110, 170],       // Shallow coastal blue
+  plains: [85, 160, 75],       // Green grassland
+  forest: [25, 95, 50],        // Dark green forest
+  desert: [210, 190, 120],     // Sandy beige desert
+  tundra: [150, 170, 160],     // Gray-green tundra
+  snow: [240, 245, 250],       // Bright white snow
+  mountain: [100, 100, 110],   // Gray mountain
+  river: [60, 140, 220]        // Bright blue river
+};
+
+/**
+ * Normalize tiles array into dense grids
+ */
+export type NormalizedTiles = {
+  size: number;
+  biomeGrid: Uint8Array; // Biome IDs (0-8)
+  riverGrid: Uint8Array; // 0 or 1
+  contestedGrid: Uint8Array; // 0 or 1
+  expectedTiles: number;
+  tilesOk: boolean;
+};
+
+const biomeToId: Record<string, number> = {
+  ocean: 0,
+  coast: 1,
+  plains: 2,
+  forest: 3,
+  desert: 4,
+  tundra: 5,
+  snow: 6,
+  mountain: 7,
+  river: 8
+};
+
+export const normalizeTiles = (
+  tiles: Array<{ x: number; y: number; biome: string; river?: boolean; contested?: boolean } | null>,
+  size: number
+): NormalizedTiles => {
+  const expectedTiles = size * size;
+  const biomeGrid = new Uint8Array(expectedTiles);
+  const riverGrid = new Uint8Array(expectedTiles);
+  const contestedGrid = new Uint8Array(expectedTiles);
   
-  // Calculate visible tile range
-  const startX = Math.max(0, Math.floor(view.left));
-  const startY = Math.max(0, Math.floor(view.top));
-  const endX = Math.min(worldState.config.size - 1, Math.ceil(view.right));
-  const endY = Math.min(worldState.config.size - 1, Math.ceil(view.bottom));
+  let validTiles = 0;
   
-  // Draw tiles in viewport
-  for (let wy = startY; wy <= endY; wy += 1) {
-    for (let wx = startX; wx <= endX; wx += 1) {
-      // Calculate screen position
-      const screenX = (wx - view.left) * zoom;
-      const screenY = (wy - view.top) * zoom;
-      const tileSize = Math.max(1, zoom);
-      
-      // Skip if outside viewport (with small margin for partial tiles)
-      if (screenX + tileSize < -1 || screenX > ctx.canvas.width + 1 || 
-          screenY + tileSize < -1 || screenY > ctx.canvas.height + 1) {
-        continue;
-      }
-      
-      const tileIndex = wy * worldState.config.size + wx;
-      const tile = worldState.tiles[tileIndex];
-      
-      if (!tile) {
-        // Draw dark background for missing tiles
-        ctx.fillStyle = "#0b0f14";
-        ctx.fillRect(screenX, screenY, tileSize, tileSize);
-      } else {
-        // Draw tile with biome color and elevation shading
-        const base = biomeColors[tile.biome] ?? "#0b0f14";
-        const shade = Math.floor(30 * (tile.elevation - 0.5));
-        ctx.fillStyle = shadeColor(base, shade);
-        ctx.fillRect(screenX, screenY, tileSize, tileSize);
-        
-        tilesRendered += 1;
-      }
+  for (let i = 0; i < tiles.length; i += 1) {
+    const tile = tiles[i];
+    if (tile && tile.x >= 0 && tile.x < size && tile.y >= 0 && tile.y < size) {
+      const index = tile.y * size + tile.x;
+      biomeGrid[index] = biomeToId[tile.biome] ?? 0;
+      riverGrid[index] = tile.river ? 1 : 0;
+      contestedGrid[index] = tile.contested ? 1 : 0;
+      validTiles += 1;
     }
   }
   
-  return { tilesRendered };
+  const tilesOk = validTiles === expectedTiles;
+  
+  return {
+    size,
+    biomeGrid,
+    riverGrid,
+    contestedGrid,
+    expectedTiles,
+    tilesOk
+  };
 };
 
-export const getChunkCanvas = (
-  worldState: { worldId: string; config: { size: number }; tiles: Array<any | null> },
-  cx: number,
-  cy: number,
-  chunkSize: number,
-  cache: Map<string, HTMLCanvasElement>,
-  biomeColors: Record<string, string>
-): HTMLCanvasElement => {
-  const key = `${worldState.worldId}:${cx}:${cy}`;
-  const cached = cache.get(key);
-  if (cached) {
-    return cached;
+/**
+ * Build ImageData for the full map from normalized grids
+ */
+export const buildMapImageData = (
+  size: number,
+  biomeGrid: Uint8Array,
+  riverGrid: Uint8Array,
+  contestedGrid: Uint8Array
+): ImageData => {
+  const imageData = new ImageData(size, size);
+  const data = imageData.data;
+  
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const index = y * size + x;
+      const biomeId = biomeGrid[index];
+      
+      // Get base color from biome
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      
+      switch (biomeId) {
+        case 0: // ocean
+          [r, g, b] = biomeRGB.ocean;
+          break;
+        case 1: // coast
+          [r, g, b] = biomeRGB.coast;
+          break;
+        case 2: // plains
+          [r, g, b] = biomeRGB.plains;
+          break;
+        case 3: // forest
+          [r, g, b] = biomeRGB.forest;
+          break;
+        case 4: // desert
+          [r, g, b] = biomeRGB.desert;
+          break;
+        case 5: // tundra
+          [r, g, b] = biomeRGB.tundra;
+          break;
+        case 6: // snow
+          [r, g, b] = biomeRGB.snow;
+          break;
+        case 7: // mountain
+          [r, g, b] = biomeRGB.mountain;
+          break;
+        case 8: // river
+          [r, g, b] = biomeRGB.river;
+          break;
+        default:
+          [r, g, b] = [11, 15, 20]; // Dark background
+      }
+      
+      // Overlay river if present
+      if (riverGrid[index] === 1 && biomeId !== 8) {
+        // Blend river color (bright blue) with biome
+        r = Math.floor(r * 0.6 + biomeRGB.river[0] * 0.4);
+        g = Math.floor(g * 0.6 + biomeRGB.river[1] * 0.4);
+        b = Math.floor(b * 0.6 + biomeRGB.river[2] * 0.4);
+      }
+      
+      // Overlay contested tint if present
+      if (contestedGrid[index] === 1) {
+        r = Math.min(255, r + 20);
+        g = Math.max(0, g - 10);
+        b = Math.max(0, b - 10);
+      }
+      
+      const pixelIndex = (y * size + x) * 4;
+      data[pixelIndex] = r; // R
+      data[pixelIndex + 1] = g; // G
+      data[pixelIndex + 2] = b; // B
+      data[pixelIndex + 3] = 255; // A
+    }
   }
-  const canvas = document.createElement("canvas");
-  canvas.width = chunkSize;
-  canvas.height = chunkSize;
+  
+  return imageData;
+};
+
+/**
+ * Create or update cached map canvas
+ */
+export const buildMapCanvas = (
+  size: number,
+  biomeGrid: Uint8Array,
+  riverGrid: Uint8Array,
+  contestedGrid: Uint8Array,
+  existingCanvas?: HTMLCanvasElement
+): HTMLCanvasElement => {
+  const canvas = existingCanvas || document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  
   const ctx = canvas.getContext("2d");
   if (!ctx) {
     return canvas;
   }
-  for (let y = 0; y < chunkSize; y += 1) {
-    for (let x = 0; x < chunkSize; x += 1) {
-      const wx = cx * chunkSize + x;
-      const wy = cy * chunkSize + y;
-      if (wx >= worldState.config.size || wy >= worldState.config.size) {
-        continue;
-      }
-      const tile = worldState.tiles[wy * worldState.config.size + wx];
-      if (!tile) {
-        ctx.fillStyle = "#0b0f14";
-        ctx.fillRect(x, y, 1, 1);
-      } else {
-        const base = biomeColors[tile.biome] ?? "#0b0f14";
-        const shade = Math.floor(30 * (tile.elevation - 0.5));
-        ctx.fillStyle = shadeColor(base, shade);
-        ctx.fillRect(x, y, 1, 1);
-      }
-    }
-  }
-  cache.set(key, canvas);
+  
+  const imageData = buildMapImageData(size, biomeGrid, riverGrid, contestedGrid);
+  ctx.putImageData(imageData, 0, 0);
+  
   return canvas;
+};
+
+/**
+ * Draw the map canvas to the main canvas with proper transforms
+ */
+export const drawMapCanvas = (
+  ctx: CanvasRenderingContext2D,
+  mapCanvas: HTMLCanvasElement,
+  camera: CameraState,
+  worldSize: number,
+  canvasWidth: number,
+  canvasHeight: number,
+  imageSmoothing: boolean
+): void => {
+  ctx.imageSmoothingEnabled = imageSmoothing;
+  
+  // Calculate visible world bounds
+  const halfW = canvasWidth / (2 * camera.zoom);
+  const halfH = canvasHeight / (2 * camera.zoom);
+  
+  const worldLeft = Math.max(0, camera.x - halfW);
+  const worldTop = Math.max(0, camera.y - halfH);
+  const worldRight = Math.min(worldSize, camera.x + halfW);
+  const worldBottom = Math.min(worldSize, camera.y + halfH);
+  
+  const worldWidth = worldRight - worldLeft;
+  const worldHeight = worldBottom - worldTop;
+  
+  // Calculate screen destination
+  const screenX = (worldLeft - camera.x) * camera.zoom + canvasWidth / 2;
+  const screenY = (worldTop - camera.y) * camera.zoom + canvasHeight / 2;
+  const screenWidth = worldWidth * camera.zoom;
+  const screenHeight = worldHeight * camera.zoom;
+  
+  // Draw the map canvas
+  ctx.drawImage(
+    mapCanvas,
+    worldLeft, worldTop, worldWidth, worldHeight, // Source rect (world coords)
+    screenX, screenY, screenWidth, screenHeight // Destination rect (screen coords)
+  );
 };
 
 export const drawFog = (
@@ -247,4 +368,3 @@ export const drawCheckerboard = (
     }
   }
 };
-
