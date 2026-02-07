@@ -1,6 +1,22 @@
 import type { WorldState, WorldConfig } from "../types";
 import { isHugeWorld } from "../world";
 
+// Maximum bytes for SQLite storage (200KB)
+const MAX_BYTES = 200 * 1024; // 204800 bytes
+
+/**
+ * Calculate JSON size in bytes using TextEncoder
+ */
+function safeJsonSize(obj: unknown): number {
+  try {
+    const json = JSON.stringify(obj);
+    return new TextEncoder().encode(json).length;
+  } catch (error) {
+    console.error("safeJsonSize error:", error);
+    return 0;
+  }
+}
+
 type StorageState = DurableObjectState["storage"];
 type SqlStorage = DurableObjectState["storage"]["sql"];
 
@@ -46,53 +62,90 @@ export const loadWorldState = async (state: DurableObjectState): Promise<WorldSt
   }
 };
 
-// Guardrail: reject payloads >200KB
-const MAX_PAYLOAD_SIZE = 200 * 1024; // 200KB
-
-const checkPayloadSize = (data: string, operation: string): void => {
-  const size = new Blob([data]).size;
-  if (size > MAX_PAYLOAD_SIZE) {
-    console.error(`Payload too large for ${operation}: ${size} bytes (max ${MAX_PAYLOAD_SIZE})`);
-    throw new Error(`Payload too large: ${size} bytes exceeds ${MAX_PAYLOAD_SIZE} bytes`);
-  }
-  if (size > 100 * 1024) {
-    console.warn(`Large payload for ${operation}: ${size} bytes`);
-  }
-};
-
-export const saveWorldState = async (state: DurableObjectState, world: WorldState): Promise<void> => {
+export const saveWorldState = async (state: DurableObjectState, world: WorldState): Promise<{ ok: boolean; skipped?: boolean; reason?: string; bytes?: number }> => {
   try {
-    // Tiles are derived data, do not persist - always exclude from save
-    // For huge worlds, tiles array is empty anyway, but ensure it's never persisted
-    const data = JSON.stringify({ ...world, tiles: [] });
-    checkPayloadSize(data, "saveWorldState");
-    exec(state.storage.sql, "INSERT OR REPLACE INTO world_state (id, data) VALUES (1, ?)", data);
+    const huge = isHugeWorld(world.config.size);
     
-    // Log once per cold start for huge worlds
-    if (isHugeWorld(world.config)) {
-      console.log(`Huge world mode (size=${world.config.size}): terrain is generated on-demand, not persisted`);
+    // For huge worlds, always persist only minimal metadata
+    if (huge) {
+      const minimalMetadata = {
+        worldId: world.worldId,
+        seed: world.config.seed,
+        size: world.config.size,
+        tick: world.tick,
+        updatedAt: Date.now(),
+        type: world.type,
+        config: {
+          seed: world.config.seed,
+          size: world.config.size,
+          tickRate: world.config.tickRate,
+          visionRadius: world.config.visionRadius,
+          fogOfWar: world.config.fogOfWar
+        }
+      };
+      const bytes = safeJsonSize(minimalMetadata);
+      if (bytes > MAX_BYTES) {
+        console.error(`Minimal metadata too large: ${bytes} bytes`);
+        return { ok: false, skipped: true, reason: "minimal_metadata_too_large", bytes };
+      }
+      exec(state.storage.sql, "INSERT OR REPLACE INTO world_state (id, data) VALUES (1, ?)", JSON.stringify(minimalMetadata));
+      console.log(`Huge world mode (size=${world.config.size}): persisted minimal metadata only (${bytes} bytes)`);
+      return { ok: true, bytes };
     }
+    
+    // For small worlds, try to save full state (without tiles)
+    const stateWithoutTiles = { ...world, tiles: [] };
+    const bytes = safeJsonSize(stateWithoutTiles);
+    
+    if (bytes > MAX_BYTES) {
+      // Fallback to minimal metadata for small worlds too if they grow too large
+      console.warn(`saveWorldState: payload too large (${bytes} bytes > ${MAX_BYTES}), persisting minimal metadata instead`);
+      const minimalMetadata = {
+        worldId: world.worldId,
+        seed: world.config.seed,
+        size: world.config.size,
+        tick: world.tick,
+        updatedAt: Date.now(),
+        type: world.type
+      };
+      const minimalBytes = safeJsonSize(minimalMetadata);
+      exec(state.storage.sql, "INSERT OR REPLACE INTO world_state (id, data) VALUES (1, ?)", JSON.stringify(minimalMetadata));
+      return { ok: true, skipped: true, reason: "too_large", bytes, minimalBytes };
+    }
+    
+    // Save full state (without tiles)
+    exec(state.storage.sql, "INSERT OR REPLACE INTO world_state (id, data) VALUES (1, ?)", JSON.stringify(stateWithoutTiles));
+    return { ok: true, bytes };
   } catch (error) {
     console.error("saveWorldState error:", error);
     // Don't throw - allow world to continue in memory
+    return { ok: false, reason: String(error) };
   }
 };
 
-export const saveSnapshot = async (state: DurableObjectState, world: WorldState): Promise<void> => {
+export const saveSnapshot = async (state: DurableObjectState, world: WorldState): Promise<{ ok: boolean; skipped?: boolean; bytes?: number }> => {
   try {
     // Store only compact snapshot data, never tiles
-    const snapshot = JSON.stringify({
+    const snapshot = {
       tick: world.tick,
       units: world.units,
       cities: world.cities,
       states: world.states,
       events: world.events
-    });
-    checkPayloadSize(snapshot, "saveSnapshot");
-    exec(state.storage.sql, "INSERT OR REPLACE INTO world_snapshots (tick, data) VALUES (?, ?)", world.tick, snapshot);
+    };
+    const bytes = safeJsonSize(snapshot);
+    
+    if (bytes > MAX_BYTES) {
+      console.warn(`saveSnapshot: payload too large (${bytes} bytes > ${MAX_BYTES}), skipping`);
+      return { ok: false, skipped: true, bytes };
+    }
+    
+    exec(state.storage.sql, "INSERT OR REPLACE INTO world_snapshots (tick, data) VALUES (?, ?)", world.tick, JSON.stringify(snapshot));
+    return { ok: true, bytes };
   } catch (error) {
     console.error("saveSnapshot error:", error);
     // Don't throw - snapshot failures shouldn't crash the world
+    return { ok: false, reason: String(error) };
   }
 };
 

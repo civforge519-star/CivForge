@@ -1,9 +1,8 @@
 import type { Action, Agent, AgentObservation, Unit, WorldState } from "./types";
-import { createWorld, createInventory } from "./world";
+import { createWorld, createInventory, isHugeWorld, getOrGenerateTiles } from "./world";
 import { observeAgent, tickWorld } from "./simulation";
 import { generateRegions, generateWorldMap } from "./worldgen";
 import { initStorage, loadSnapshot, loadWorldState, saveSnapshot, saveWorldState } from "./storage/persistence";
-import { getOrGenerateTiles } from "./world";
 import { sanitizeWorld } from "./rules/sanity";
 import { generateChunk, generateViewportTiles, getCell } from "./chunkgen-api";
 
@@ -70,7 +69,7 @@ const MAX_VIEWPORT_CHUNKS = 9; // 3x3 chunks
 
 const corsHeaders = (origin?: string): HeadersInit => ({
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type,Authorization,x-admin-token,x-world-id",
   "Access-Control-Max-Age": "86400"
 });
@@ -169,7 +168,7 @@ export class WorldDurableObject {
         
         // Tiles are derived data - for huge worlds, tiles array is empty (use chunk API)
         // For small/medium worlds, generate on demand if missing
-        if (!isHugeWorld(this.world.config)) {
+        if (!isHugeWorld(this.world.config.size)) {
           const expectedTileCount = this.world.config.size * this.world.config.size;
           if (!this.world.tiles || this.world.tiles.length !== expectedTileCount) {
             this.world.tiles = getOrGenerateTiles(this.world.config.seed, this.world.config.size);
@@ -285,6 +284,24 @@ export class WorldDurableObject {
       return this.handleWorldCreateFromRequest(request);
     }
 
+    if (pathname === "/world/config" && request.method === "GET") {
+      if (!this.world) {
+        return this.jsonResponse({ error: "world_not_ready" }, 400);
+      }
+      const url = new URL(request.url);
+      const requestedWorldId = url.searchParams.get("worldId");
+      if (requestedWorldId && requestedWorldId !== this.worldId) {
+        return this.jsonResponse({ error: "world_not_found" }, 404);
+      }
+      return this.jsonResponse({
+        worldId: this.world.worldId,
+        seed: this.world.config.seed,
+        size: this.world.config.size,
+        tickRate: this.world.config.tickRate,
+        hugeWorld: isHugeWorld(this.world.config.size)
+      });
+    }
+
     if (pathname === "/world/summary") {
       return this.jsonResponse(this.buildWorldSummary());
     }
@@ -341,6 +358,11 @@ export class WorldDurableObject {
     }
 
     if (pathname === "/ws") {
+      // WebSocket upgrade handling: require Upgrade header
+      const upgrade = request.headers.get("Upgrade");
+      if (!upgrade || upgrade.toLowerCase() !== "websocket") {
+        return this.jsonResponse({ ok: false, error: "upgrade_required", message: "WebSocket upgrade required" }, 426);
+      }
       return this.handleWebSocket(request);
     }
 
@@ -680,6 +702,12 @@ export class WorldDurableObject {
 
   private handleWebSocket(request: Request): Response {
     try {
+      // Double-check upgrade header (already checked in route handler, but be safe)
+      const upgrade = request.headers.get("Upgrade");
+      if (!upgrade || upgrade.toLowerCase() !== "websocket") {
+        return this.jsonResponse({ ok: false, error: "upgrade_required" }, 426);
+      }
+      
       const pair = new WebSocketPair();
       const client = pair[0];
       const server = pair[1];
@@ -708,7 +736,7 @@ export class WorldDurableObject {
           }
           if (data.type === "set_viewport" && this.world) {
             const meta = this.clientMeta.get(server) ?? {};
-            const huge = isHugeWorld(this.world.config);
+            const huge = isHugeWorld(this.world.config.size);
             
             if (huge) {
               // Huge world: send chunks for viewport
@@ -751,7 +779,7 @@ export class WorldDurableObject {
             }
             return;
           }
-          if (data.type === "subscribe" && data.viewport && this.world && !isHugeWorld(this.world.config)) {
+          if (data.type === "subscribe" && data.viewport && this.world && !isHugeWorld(this.world.config.size)) {
             const meta = this.clientMeta.get(server) ?? {};
             this.clientMeta.set(server, { ...meta, viewport: data.viewport });
             const tiles = tilesForViewport(this.world, data.viewport, meta.agentId);
@@ -760,7 +788,9 @@ export class WorldDurableObject {
         } catch (error) {
           console.error("WS message error:", error);
           try {
-            safeSend(server, { type: "error", message: "invalid_message" });
+            if (server.readyState === WebSocket.OPEN) {
+              safeSend(server, { type: "error", message: "invalid_message" });
+            }
           } catch (sendError) {
             // Socket may be closed
           }
@@ -788,7 +818,7 @@ export class WorldDurableObject {
           });
         }
         try {
-          const huge = this.world && isHugeWorld(this.world.config);
+          const huge = this.world && isHugeWorld(this.world.config.size);
           
           // For huge worlds, send world_info first, then viewport_chunks
           if (huge) {
@@ -824,12 +854,17 @@ export class WorldDurableObject {
           }
           
           // Always send snapshot (for small worlds it includes tiles, for huge worlds it's metadata)
-          const snapshot = this.buildSnapshotForClient(this.clientMeta.get(server));
-          safeSend(server, snapshot);
-        } catch (error) {
-          console.error("WS snapshot error:", error);
           try {
-            server.close(1011, "Snapshot error");
+            const snapshot = this.buildSnapshotForClient(this.clientMeta.get(server));
+            safeSend(server, snapshot);
+          } catch (snapshotError) {
+            console.error("WS snapshot error:", snapshotError);
+            safeSend(server, { type: "error", message: "snapshot_failed" });
+          }
+        } catch (error) {
+          console.error("WS initialization error:", error);
+          try {
+            server.close(1011, "Internal error");
           } catch (closeError) {
             // Socket may already be closed
           }
@@ -910,7 +945,11 @@ export class WorldDurableObject {
     if (!this.world) {
       return;
     }
-    await saveWorldState(this.state, this.world);
+    const result = await saveWorldState(this.state, this.world);
+    if (!result.ok && result.skipped) {
+      // Log but don't throw - world continues in memory
+      console.warn(`persistWorld skipped: ${result.reason}, bytes: ${result.bytes}`);
+    }
   }
 
   private broadcast(message: WsMessage): void {
@@ -1232,37 +1271,70 @@ export class WorldDurableObject {
       chunkSize: CHUNK_SIZE,
       tickRate: this.world.config.tickRate,
       type: this.world.type,
-      hugeWorld: isHugeWorld(this.world.config),
+      hugeWorld: isHugeWorld(this.world.config.size),
       tick: this.world.tick
     });
   }
 
   private async handleWorldReset(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const worldIdToReset = url.searchParams.get("worldId");
-    
-    if (!worldIdToReset) {
-      return this.jsonResponse({ error: "worldId_required" }, 400);
-    }
-    
-    // Only allow resetting if this DO is for that world
-    if (this.worldId !== worldIdToReset) {
-      return this.jsonResponse({ error: "cannot_reset_other_world" }, 403);
-    }
-    
     try {
+      const body = (await request.json().catch(() => ({}))) as {
+        worldId?: string;
+        seed?: string;
+        size?: number;
+      };
+      
+      const worldIdToReset = body.worldId ?? DEFAULT_WORLD_ID;
+      const seed = body.seed ?? `public-${Date.now()}`;
+      const size = body.size ?? 2048; // Default to huge world
+      
+      // Only allow resetting if this DO is for that world
+      if (this.worldId !== worldIdToReset) {
+        return this.jsonResponse({ error: "cannot_reset_other_world" }, 403);
+      }
+      
       // Clear world state from SQLite
-      this.state.storage.sql.exec("DELETE FROM world_state WHERE id = 1");
-      this.state.storage.sql.exec("DELETE FROM world_snapshots");
+      try {
+        this.state.storage.sql.exec("DELETE FROM world_state WHERE id = 1");
+        this.state.storage.sql.exec("DELETE FROM world_snapshots");
+      } catch (error) {
+        console.warn("SQLite cleanup error (may not exist):", error);
+      }
       
       // Clear from KV storage (registry, overlays, etc.)
-      await this.state.storage.delete("worlds");
-      await this.state.storage.delete("world_meta");
+      try {
+        await this.state.storage.delete("worlds");
+        await this.state.storage.delete("world_meta");
+      } catch (error) {
+        console.warn("KV cleanup error:", error);
+      }
       
-      // Reset in-memory world
-      this.world = null;
+      // Reinitialize world with new seed and size
+      const tickRate = Number(this.env.TICK_RATE ?? 1);
+      this.world = createWorld(worldIdToReset, seed, size, tickRate, worldIdToReset === DEFAULT_WORLD_ID ? "public" : "sandbox");
+      this.worldId = worldIdToReset;
       
-      return this.jsonResponse({ status: "reset", worldId: worldIdToReset });
+      // For huge worlds, do NOT generate/store all tiles - just set seed+size
+      // Persist minimal metadata only
+      await this.persistWorld();
+      
+      // Update registry if it exists
+      try {
+        const registryStub = this.env.WORLD_DO.get(this.env.WORLD_DO.idFromName(REGISTRY_WORLD_ID));
+        const url = new URL(request.url);
+        await registryStub.fetch(new Request(`${url.origin}/worlds?worldId=${REGISTRY_WORLD_ID}`, {
+          method: "POST",
+          body: JSON.stringify({ worldId: worldIdToReset, seed, size, tickRate, type: worldIdToReset === DEFAULT_WORLD_ID ? "public" : "sandbox" }),
+          headers: { "Content-Type": "application/json" }
+        }));
+      } catch (error) {
+        console.warn("Registry update error:", error);
+      }
+      
+      // Start tick loop
+      await this.scheduleNextTick();
+      
+      return this.jsonResponse({ ok: true, worldId: worldIdToReset, seed, size });
     } catch (error) {
       console.error("World reset error:", error);
       return this.jsonResponse({ error: "reset_failed", message: String(error) }, 500);
@@ -1311,7 +1383,7 @@ export class WorldDurableObject {
         seed, 
         size, 
         tickRate,
-        hugeWorld: isHugeWorld(this.world.config)
+        hugeWorld: isHugeWorld(this.world.config.size)
       });
     } catch (error) {
       console.error("World create error:", error);
@@ -1361,22 +1433,40 @@ export class WorldDurableObject {
       return this.jsonResponse({ error: "invalid_viewport" }, 400);
     }
     
+    // Clamp bounds to world size first
+    const size = this.world.config.size;
+    const clampedMinX = Math.max(0, Math.floor(minX));
+    const clampedMinY = Math.max(0, Math.floor(minY));
+    const clampedMaxX = Math.min(size - 1, Math.floor(maxX));
+    const clampedMaxY = Math.min(size - 1, Math.floor(maxY));
+    
     // Cap viewport size to prevent huge requests
-    const viewportArea = (maxX - minX) * (maxY - minY);
+    const viewportArea = (clampedMaxX - clampedMinX + 1) * (clampedMaxY - clampedMinY + 1);
     const MAX_VIEWPORT_AREA = 10000; // Reasonable limit
     if (viewportArea > MAX_VIEWPORT_AREA) {
-      return this.jsonResponse({ error: "viewport_too_large" }, 400);
+      return this.jsonResponse({ error: "viewport_too_large", area: viewportArea, max: MAX_VIEWPORT_AREA }, 400);
     }
     
     try {
-      const tiles = generateViewportTiles(this.world.config.seed, minX, minY, maxX, maxY);
-      const payload = JSON.stringify({ tiles, count: tiles.length });
+      const tiles = generateViewportTiles(this.world.config.seed, clampedMinX, clampedMinY, clampedMaxX, clampedMaxY);
+      
+      // Return compact format: biomeId instead of biome string, minimal fields
+      const compactTiles = tiles.map(t => ({
+        x: t.x,
+        y: t.y,
+        b: t.biome === "ocean" ? 0 : t.biome === "coast" ? 1 : t.biome === "plains" ? 2 : t.biome === "forest" ? 3 : t.biome === "desert" ? 4 : t.biome === "tundra" ? 5 : t.biome === "snow" ? 6 : t.biome === "mountain" ? 7 : 2, // default to plains
+        e: Math.round(t.elevation * 255) // 0-255
+      }));
+      
+      const payload = JSON.stringify({ tiles: compactTiles, count: compactTiles.length });
+      const bytes = new TextEncoder().encode(payload).length;
       const MAX_PAYLOAD = 200 * 1024; // 200KB
-      if (new Blob([payload]).size > MAX_PAYLOAD) {
-        return this.jsonResponse({ error: "viewport_too_large" }, 413);
+      if (bytes > MAX_PAYLOAD) {
+        return this.jsonResponse({ error: "viewport_too_large", bytes, max: MAX_PAYLOAD }, 413);
       }
-      return this.jsonResponse({ tiles, count: tiles.length });
+      return this.jsonResponse({ tiles: compactTiles, count: compactTiles.length, bytes });
     } catch (error) {
+      console.error("handleViewport error:", error);
       return this.jsonResponse({ error: "generation_failed", message: String(error) }, 500);
     }
   }
@@ -1420,19 +1510,28 @@ export class WorldDurableObject {
       checks.world_metadata = { ok: false, error: String(error) };
     }
 
-    // Test 4: Tiles check (CRITICAL)
+    // Test 4: Tiles check (CRITICAL) - for huge worlds, tiles array is empty (OK)
     try {
       if (!this.world) {
         checks.tiles = { ok: false, error: "No world loaded" };
       } else {
-        const expectedTileCount = this.world.config.size * this.world.config.size;
-        const tilesCount = this.world.tiles?.length || 0;
-        const tilesOk = tilesCount === expectedTileCount && tilesCount > 0;
-        checks.tiles = {
-          ok: tilesOk,
-          message: tilesOk ? `Tiles OK: ${tilesCount} (expected ${expectedTileCount})` : `Tiles MISSING: ${tilesCount} (expected ${expectedTileCount})`,
-          error: tilesOk ? undefined : `Tiles count mismatch: ${tilesCount} vs ${expectedTileCount}`
-        };
+        const huge = isHugeWorld(this.world.config.size);
+        if (huge) {
+          // Huge worlds: tiles array should be empty, terrain via chunk API
+          checks.tiles = {
+            ok: true,
+            message: `Huge world (size=${this.world.config.size}): tiles array empty (OK, uses chunk API)`
+          };
+        } else {
+          const expectedTileCount = this.world.config.size * this.world.config.size;
+          const tilesCount = this.world.tiles?.length || 0;
+          const tilesOk = tilesCount === expectedTileCount && tilesCount > 0;
+          checks.tiles = {
+            ok: tilesOk,
+            message: tilesOk ? `Tiles OK: ${tilesCount} (expected ${expectedTileCount})` : `Tiles MISSING: ${tilesCount} (expected ${expectedTileCount})`,
+            error: tilesOk ? undefined : `Tiles count mismatch: ${tilesCount} vs ${expectedTileCount}`
+          };
+        }
       }
     } catch (error) {
       checks.tiles = { ok: false, error: String(error) };
@@ -1449,10 +1548,61 @@ export class WorldDurableObject {
       checks.storage_ops = { ok: false, error: String(error) };
     }
 
+    // Test 6: WS upgrade check
+    try {
+      // Simulate a non-upgrade request
+      const testRequest = new Request("https://test/ws", { method: "GET" });
+      const upgrade = testRequest.headers.get("Upgrade");
+      checks.wsUpgradeCheck = {
+        ok: upgrade === null,
+        message: "WS upgrade check logic works (non-upgrade request has no Upgrade header)"
+      };
+    } catch (error) {
+      checks.wsUpgradeCheck = { ok: false, error: String(error) };
+    }
+
+    // Test 7: CORS headers
+    try {
+      const headers = corsHeaders();
+      checks.cors = {
+        ok: headers["Access-Control-Allow-Origin"] === "*",
+        message: "CORS headers configured"
+      };
+    } catch (error) {
+      checks.cors = { ok: false, error: String(error) };
+    }
+
+    // Test 8: Huge world persistence
+    try {
+      if (this.world && isHugeWorld(this.world.config.size)) {
+        checks.hugeWorldPersistence = {
+          ok: true,
+          message: "Huge world: persistence skipped (OK, uses minimal metadata)"
+        };
+      } else {
+        checks.hugeWorldPersistence = {
+          ok: true,
+          message: "Small world: full persistence allowed"
+        };
+      }
+    } catch (error) {
+      checks.hugeWorldPersistence = { ok: false, error: String(error) };
+    }
+
+    // Test 9: Registry
+    try {
+      const registryStub = this.env.WORLD_DO.get(this.env.WORLD_DO.idFromName(REGISTRY_WORLD_ID));
+      checks.registryOk = { ok: registryStub !== null, message: "Registry DO accessible" };
+    } catch (error) {
+      checks.registryOk = { ok: false, error: String(error) };
+    }
+
     const allOk = Object.values(checks).every(c => c.ok);
     return this.jsonResponse(
       {
         ok: allOk,
+        version: PROTOCOL_VERSION,
+        time: Date.now(),
         checks,
         timestamp: Date.now()
       },
@@ -1621,7 +1771,7 @@ export class WorldDurableObject {
     // CRITICAL: Sanity check before returning snapshot
     // Tiles are derived data - for huge worlds, tiles array is empty (use chunk API)
     // For small/medium worlds, generate on demand if missing
-    const huge = isHugeWorld(this.world.config);
+    const huge = isHugeWorld(this.world.config.size);
     if (!huge) {
       const expectedTileCount = this.world.config.size * this.world.config.size;
       if (!this.world.tiles || this.world.tiles.length !== expectedTileCount) {

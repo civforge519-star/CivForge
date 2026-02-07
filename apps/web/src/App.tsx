@@ -1356,6 +1356,46 @@ const App = () => {
         </div>
         <section className="panel">
           <h2>Observer Dashboard</h2>
+          {adminToken && (
+            <div style={{ marginBottom: "1rem" }}>
+              <button
+                onClick={async () => {
+                  try {
+                    const response = await fetch(`${HTTP_BASE}/world/reset`, {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                        "x-admin-token": adminToken
+                      },
+                      body: JSON.stringify({ worldId: "public", size: 2048, seed: `public-${Date.now()}` })
+                    });
+                    if (!response.ok) {
+                      const error = await response.json().catch(() => ({ error: "Unknown error" }));
+                      alert(`Failed to reset world: ${error.error || "Unknown error"}`);
+                      return;
+                    }
+                    const data = await response.json();
+                    alert(`World reset! New seed: ${data.seed}, size: ${data.size}`);
+                    // Refresh snapshot and reconnect WS
+                    window.location.reload();
+                  } catch (error) {
+                    console.error("Reset world error:", error);
+                    alert(`Failed to reset world: ${String(error)}`);
+                  }
+                }}
+                style={{
+                  padding: "0.5rem 1rem",
+                  backgroundColor: "#4a9eff",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "4px",
+                  cursor: "pointer"
+                }}
+              >
+                New Huge World
+              </button>
+            </div>
+          )}
           <div className="stat">
             <span>World</span>
             <span style={{ color: "var(--accent)", flex: 1, marginLeft: 12 }}>

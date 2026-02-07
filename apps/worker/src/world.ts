@@ -4,19 +4,27 @@ import { ChunkWorldGenerator, generateWorldTilesFromChunks } from "./chunkgen";
 
 /**
  * Check if world is huge (uses chunk streaming, no tile persistence)
+ * Threshold: size > 256 (allows 256x256 = 65536 tiles, but 512x512 = 262144 tiles is too large)
  */
-export const isHugeWorld = (config: WorldConfig): boolean => {
-  return config.size >= 512;
-};
+export function isHugeWorld(size: number): boolean {
+  return size > 256;
+}
+
+/**
+ * Get world size from environment or default
+ */
+export function getWorldSizeFromEnv(env: { WORLD_SIZE?: string }): number {
+  return Number(env.WORLD_SIZE ?? 128);
+}
 
 /**
  * Get or generate tiles deterministically from seed
  * Tiles are derived data, do not persist - always generate on demand
- * For huge worlds (>=512), returns empty array - use chunk API instead
+ * For huge worlds (>256), returns empty array - use chunk API instead
  */
 export const getOrGenerateTiles = (seed: string, size: number): WorldState["tiles"] => {
   // Huge worlds: do not generate full tile array, use chunk streaming
-  if (size >= 512) {
+  if (isHugeWorld(size)) {
     return []; // Empty - client must use chunk API
   }
   // For small worlds (<=256), use legacy generation for compatibility
