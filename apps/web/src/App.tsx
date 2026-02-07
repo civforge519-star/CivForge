@@ -160,8 +160,8 @@ const App = () => {
   const [connected, setConnected] = useState(false);
   const [events, setEvents] = useState<string[]>([]);
   const [speed, setSpeed] = useState(1);
-  // Single global world - humans observe the persistent "public" world
-  const [worldId] = useState("public");
+  // Single global world - humans observe the persistent "public2" huge world
+  const [worldId] = useState("public2");
   const [worlds, setWorlds] = useState<WorldSummary[]>([]);
   // Sandbox creation only (admin-only, separate from global world)
   const [newWorldId, setNewWorldId] = useState("");
