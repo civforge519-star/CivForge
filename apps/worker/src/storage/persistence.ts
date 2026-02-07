@@ -20,7 +20,7 @@ function all<T = any>(sql: SqlStorage, query: string, ...args: any[]): T[] {
 export const initStorage = (state: DurableObjectState): void => {
   try {
     exec(state.storage.sql, "CREATE TABLE IF NOT EXISTS world_state (id INTEGER PRIMARY KEY, data TEXT NOT NULL)");
-    exec(state.storage.sql, "CREATE TABLE IF NOT EXISTS world_tiles (seed TEXT PRIMARY KEY, data TEXT NOT NULL)");
+    // Tiles are derived data, do not persist - removed world_tiles table
     exec(state.storage.sql, "CREATE TABLE IF NOT EXISTS world_snapshots (tick INTEGER PRIMARY KEY, data TEXT NOT NULL)");
   } catch (error) {
     console.error("initStorage error:", error);
@@ -35,12 +35,9 @@ export const loadWorldState = async (state: DurableObjectState): Promise<WorldSt
       return null;
     }
     const parsed = JSON.parse(row.data) as WorldState;
-    if (!parsed.tiles || parsed.tiles.length === 0) {
-      const tiles = await loadTiles(state.storage, parsed.config.seed);
-      if (tiles) {
-        parsed.tiles = tiles;
-      }
-    }
+    // Tiles are derived data, do not load from storage - will be generated on demand
+    // Remove tiles from loaded state to force regeneration
+    parsed.tiles = [];
     return parsed;
   } catch (error) {
     console.error("loadWorldState error:", error);
@@ -48,12 +45,25 @@ export const loadWorldState = async (state: DurableObjectState): Promise<WorldSt
   }
 };
 
+// Guardrail: reject payloads >200KB
+const MAX_PAYLOAD_SIZE = 200 * 1024; // 200KB
+
+const checkPayloadSize = (data: string, operation: string): void => {
+  const size = new Blob([data]).size;
+  if (size > MAX_PAYLOAD_SIZE) {
+    console.error(`Payload too large for ${operation}: ${size} bytes (max ${MAX_PAYLOAD_SIZE})`);
+    throw new Error(`Payload too large: ${size} bytes exceeds ${MAX_PAYLOAD_SIZE} bytes`);
+  }
+  if (size > 100 * 1024) {
+    console.warn(`Large payload for ${operation}: ${size} bytes`);
+  }
+};
+
 export const saveWorldState = async (state: DurableObjectState, world: WorldState): Promise<void> => {
   try {
-    if (!(await hasTiles(state.storage, world.config.seed))) {
-      await saveTiles(state.storage, world.config.seed, world.tiles);
-    }
+    // Tiles are derived data, do not persist - always exclude from save
     const data = JSON.stringify({ ...world, tiles: [] });
+    checkPayloadSize(data, "saveWorldState");
     exec(state.storage.sql, "INSERT OR REPLACE INTO world_state (id, data) VALUES (1, ?)", data);
   } catch (error) {
     console.error("saveWorldState error:", error);
@@ -63,6 +73,7 @@ export const saveWorldState = async (state: DurableObjectState, world: WorldStat
 
 export const saveSnapshot = async (state: DurableObjectState, world: WorldState): Promise<void> => {
   try {
+    // Store only compact snapshot data, never tiles
     const snapshot = JSON.stringify({
       tick: world.tick,
       units: world.units,
@@ -70,6 +81,7 @@ export const saveSnapshot = async (state: DurableObjectState, world: WorldState)
       states: world.states,
       events: world.events
     });
+    checkPayloadSize(snapshot, "saveSnapshot");
     exec(state.storage.sql, "INSERT OR REPLACE INTO world_snapshots (tick, data) VALUES (?, ?)", world.tick, snapshot);
   } catch (error) {
     console.error("saveSnapshot error:", error);
@@ -90,43 +102,6 @@ export const loadSnapshot = async (state: DurableObjectState, tick: number): Pro
   }
 };
 
-const hasTiles = async (storage: StorageState, seed: string): Promise<boolean> => {
-  try {
-    const row = one<{ seed: string }>(storage.sql, "SELECT seed FROM world_tiles WHERE seed = ?", seed);
-    return Boolean(row);
-  } catch (error) {
-    console.error("hasTiles error:", error);
-    return false;
-  }
-};
-
-export const saveTiles = async (storage: StorageState, seed: string, tiles: WorldState["tiles"]): Promise<void> => {
-  try {
-    if (!tiles || tiles.length === 0) {
-      console.warn("saveTiles: Attempted to save empty tiles array");
-      return;
-    }
-    exec(storage.sql, "INSERT OR REPLACE INTO world_tiles (seed, data) VALUES (?, ?)", seed, JSON.stringify(tiles));
-  } catch (error) {
-    console.error("saveTiles error:", error);
-    // Don't throw - tile save failures shouldn't crash
-  }
-};
-
-export const loadTiles = async (storage: StorageState, seed: string): Promise<WorldState["tiles"] | null> => {
-  try {
-    const row = one<{ data: string }>(storage.sql, "SELECT data FROM world_tiles WHERE seed = ?", seed);
-    if (!row?.data) {
-      return null;
-    }
-    const parsed = JSON.parse(row.data) as WorldState["tiles"];
-    if (!parsed || parsed.length === 0) {
-      return null;
-    }
-    return parsed;
-  } catch (error) {
-    console.error("loadTiles error:", error);
-    return null;
-  }
-};
+// Tiles are derived data, do not persist
+// Removed saveTiles, loadTiles, hasTiles - tiles are generated deterministically from seed
 

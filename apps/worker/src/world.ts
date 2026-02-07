@@ -1,6 +1,20 @@
-import type { Inventory, Position, WorldConfig, WorldState } from "./types";
+import type { Inventory, Position, WorldConfig, WorldState, Tile } from "./types";
 import { generateWorldMap, generateRegions } from "./worldgen";
 import { ChunkWorldGenerator, generateWorldTilesFromChunks } from "./chunkgen";
+
+/**
+ * Get or generate tiles deterministically from seed
+ * Tiles are derived data, do not persist - always generate on demand
+ */
+export const getOrGenerateTiles = (seed: string, size: number): WorldState["tiles"] => {
+  // For small worlds (<=256), use legacy generation for compatibility
+  if (size <= 256) {
+    return generateWorldMap(seed, size);
+  }
+  // For larger worlds, use chunk-based generation
+  const generator = new ChunkWorldGenerator(seed, 100);
+  return generateWorldTilesFromChunks(generator, size);
+};
 
 const defaultInventory = (): Inventory => ({
   food: 0,
@@ -38,18 +52,9 @@ export const createWorld = (
   };
   const mergedConfig = { ...config, ...overrides };
 
-  // Use chunk-based generation for new worlds (backward compatible)
-  // For small worlds (< 256), use old system for compatibility
-  // For larger worlds, use chunk-based system
-  let tiles: WorldState["tiles"];
-  if (mergedConfig.size <= 256) {
-    // Small world: use legacy generation for backward compatibility
-    tiles = generateWorldMap(mergedConfig.seed, mergedConfig.size);
-  } else {
-    // Large world: use chunk-based generation
-    const generator = new ChunkWorldGenerator(mergedConfig.seed, 100);
-    tiles = generateWorldTilesFromChunks(generator, mergedConfig.size);
-  }
+  // Tiles are derived data, generated deterministically from seed
+  // Do not store tiles in world state - generate on demand
+  const tiles: WorldState["tiles"] = getOrGenerateTiles(mergedConfig.seed, mergedConfig.size);
   
   const regions = generateRegions(tiles, mergedConfig.size);
 

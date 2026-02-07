@@ -2,8 +2,10 @@ import type { Action, Agent, AgentObservation, Unit, WorldState } from "./types"
 import { createWorld, createInventory } from "./world";
 import { observeAgent, tickWorld } from "./simulation";
 import { generateRegions, generateWorldMap } from "./worldgen";
-import { initStorage, loadSnapshot, loadWorldState, saveSnapshot, saveWorldState, saveTiles, loadTiles } from "./storage/persistence";
+import { initStorage, loadSnapshot, loadWorldState, saveSnapshot, saveWorldState } from "./storage/persistence";
+import { getOrGenerateTiles } from "./world";
 import { sanitizeWorld } from "./rules/sanity";
+import { generateChunk, generateViewportTiles } from "./chunkgen-api";
 
 type Env = {
   WORLD_DO: DurableObjectNamespace;
@@ -26,6 +28,7 @@ type WsMessage =
       serverTime: number;
       config: WorldState["config"];
       tiles: WorldState["tiles"];
+      tilesMeta: { mode: "full" | "chunked"; size: number; tileCount: number };
       chunkOwnership: WorldState["chunkOwnership"];
       regions: WorldState["regions"];
       units: WorldState["units"];
@@ -158,21 +161,10 @@ export class WorldDurableObject {
           await this.persistWorld();
         }
         
-        // CRITICAL: Ensure tiles exist - regenerate if missing or wrong size
+        // Tiles are derived data - always generate deterministically from seed
         const expectedTileCount = this.world.config.size * this.world.config.size;
         if (!this.world.tiles || this.world.tiles.length !== expectedTileCount) {
-          console.warn(`World tiles missing or wrong size (${this.world.tiles?.length || 0} vs ${expectedTileCount}), regenerating...`);
-          const tiles = await loadTiles(this.state.storage, this.world.config.seed);
-          if (tiles && tiles.length === expectedTileCount) {
-            this.world.tiles = tiles;
-          } else {
-            // Generate new tiles
-            const { generateWorldMap } = await import("./worldgen");
-            this.world.tiles = generateWorldMap(this.world.config.seed, this.world.config.size);
-            // Save tiles for future loads
-            await saveTiles(this.state.storage, this.world.config.seed, this.world.tiles);
-          }
-          await this.persistWorld();
+          this.world.tiles = getOrGenerateTiles(this.world.config.seed, this.world.config.size);
         }
       } else {
         const size = Number(this.env.WORLD_SIZE ?? 128);
@@ -182,8 +174,7 @@ export class WorldDurableObject {
         const finalWorldId = this.worldId === DEFAULT_WORLD_ID || this.worldId === "public" ? DEFAULT_WORLD_ID : this.worldId;
         this.world = createWorld(finalWorldId, seed, size, tickRate, finalWorldId === DEFAULT_WORLD_ID ? "public" : "sandbox");
         this.worldId = finalWorldId;
-        // Ensure tiles are saved
-        await saveTiles(this.state.storage, this.world.config.seed, this.world.tiles);
+        // Tiles are derived data, do not persist - already generated in createWorld
         await this.persistWorld();
       }
     } catch (error) {
@@ -253,6 +244,14 @@ export class WorldDurableObject {
 
     if (pathname === "/world/snapshot") {
       return this.handleSnapshot(request);
+    }
+
+    if (pathname === "/world/chunk") {
+      return this.handleChunk(request);
+    }
+
+    if (pathname === "/world/viewport") {
+      return this.handleViewport(request);
     }
 
     if (pathname === "/world/summary") {
@@ -1124,10 +1123,71 @@ export class WorldDurableObject {
     const seed = body.seed ?? crypto.randomUUID();
     const worldId = body.worldId ?? `sandbox-${crypto.randomUUID()}`;
     this.world = createWorld(worldId, seed, size, tickRate, type, body.config ?? {});
-    // Ensure tiles are saved
-    await saveTiles(this.state.storage, this.world.config.seed, this.world.tiles);
+    // Tiles are derived data, do not persist - already generated in createWorld
     await this.persistWorld();
     return this.jsonResponse({ status: "created", worldId, seed, type });
+  }
+
+  private async handleChunk(request: Request): Promise<Response> {
+    if (!this.world) {
+      return this.jsonResponse({ error: "world_not_ready" }, 400);
+    }
+    const url = new URL(request.url);
+    const cx = Number(url.searchParams.get("cx"));
+    const cy = Number(url.searchParams.get("cy"));
+    const lod = Number(url.searchParams.get("lod") ?? "0") as 0 | 1 | 2;
+    
+    if (isNaN(cx) || isNaN(cy)) {
+      return this.jsonResponse({ error: "invalid_coords" }, 400);
+    }
+    
+    // Cap payload size - reject if too large
+    const MAX_CHUNK_PAYLOAD = 200 * 1024; // 200KB
+    try {
+      const chunk = generateChunk(this.world.config.seed, cx, cy, lod);
+      const payload = JSON.stringify(chunk);
+      if (new Blob([payload]).size > MAX_CHUNK_PAYLOAD) {
+        return this.jsonResponse({ error: "chunk_too_large" }, 413);
+      }
+      return this.jsonResponse(chunk);
+    } catch (error) {
+      return this.jsonResponse({ error: "generation_failed", message: String(error) }, 500);
+    }
+  }
+
+  private async handleViewport(request: Request): Promise<Response> {
+    if (!this.world) {
+      return this.jsonResponse({ error: "world_not_ready" }, 400);
+    }
+    const url = new URL(request.url);
+    const minX = Number(url.searchParams.get("minX"));
+    const minY = Number(url.searchParams.get("minY"));
+    const maxX = Number(url.searchParams.get("maxX"));
+    const maxY = Number(url.searchParams.get("maxY"));
+    const lod = Number(url.searchParams.get("lod") ?? "0") as 0 | 1 | 2;
+    
+    if (isNaN(minX) || isNaN(minY) || isNaN(maxX) || isNaN(maxY)) {
+      return this.jsonResponse({ error: "invalid_viewport" }, 400);
+    }
+    
+    // Cap viewport size to prevent huge requests
+    const viewportArea = (maxX - minX) * (maxY - minY);
+    const MAX_VIEWPORT_AREA = 10000; // Reasonable limit
+    if (viewportArea > MAX_VIEWPORT_AREA) {
+      return this.jsonResponse({ error: "viewport_too_large" }, 400);
+    }
+    
+    try {
+      const tiles = generateViewportTiles(this.world.config.seed, minX, minY, maxX, maxY);
+      const payload = JSON.stringify({ tiles, count: tiles.length });
+      const MAX_PAYLOAD = 200 * 1024; // 200KB
+      if (new Blob([payload]).size > MAX_PAYLOAD) {
+        return this.jsonResponse({ error: "viewport_too_large" }, 413);
+      }
+      return this.jsonResponse({ tiles, count: tiles.length });
+    } catch (error) {
+      return this.jsonResponse({ error: "generation_failed", message: String(error) }, 500);
+    }
   }
 
   private logAudit(entry: { id: string; type: string; data: unknown }): void {
@@ -1269,66 +1329,70 @@ export class WorldDurableObject {
       return { type: "error", message: "world_not_ready" };
     }
     
-    // CRITICAL: Sanity check - ensure tiles exist before building snapshot
+    // SNAPSHOT CONTRACT: ALWAYS RENDERABLE, NEVER EMPTY
+    // Tiles are derived data, regenerate deterministically if missing
     const expectedTileCount = this.world.config.size * this.world.config.size;
     if (!this.world.tiles || this.world.tiles.length !== expectedTileCount) {
-      console.error(`CRITICAL: World tiles missing or wrong size (${this.world.tiles?.length || 0} vs ${expectedTileCount})`);
-      // Regenerate tiles synchronously (this should not happen if initialization worked)
-      this.world.tiles = generateWorldMap(this.world.config.seed, this.world.config.size);
-      // Save tiles asynchronously (don't await)
-      saveTiles(this.state.storage, this.world.config.seed, this.world.tiles).catch(err => 
-        console.error("Failed to save regenerated tiles:", err)
-      );
+      console.warn(`World tiles missing or wrong size (${this.world.tiles?.length || 0} vs ${expectedTileCount}), regenerating...`);
+      this.world.tiles = getOrGenerateTiles(this.world.config.seed, this.world.config.size);
     }
+    
+    // Determine tiles mode: full for size <= 128, chunked for larger
+    const tilesMode: "full" | "chunked" = this.world.config.size <= 128 ? "full" : "chunked";
+    const tilesMeta = {
+      mode: tilesMode,
+      size: this.world.config.size,
+      tileCount: this.world.tiles.length
+    };
+    
+    // Validate tilesMeta contract
+    if (tilesMeta.mode === "full" && tilesMeta.tileCount !== tilesMeta.size * tilesMeta.size) {
+      console.error(`CRITICAL: tilesMeta contract violation - full mode requires ${tilesMeta.size * tilesMeta.size} tiles, got ${tilesMeta.tileCount}`);
+      this.world.tiles = getOrGenerateTiles(this.world.config.seed, this.world.config.size);
+      tilesMeta.tileCount = this.world.tiles.length;
+    }
+    
+    const baseSnapshot = {
+      type: "snapshot" as const,
+      protocolVersion: PROTOCOL_VERSION,
+      snapshotVersion: SNAPSHOT_VERSION,
+      worldId: this.world.worldId,
+      worldType: this.world.type,
+      seed: this.world.config.seed,
+      tick: this.world.tick,
+      serverTime: Date.now(),
+      config: this.world.config,
+      tiles: this.world.tiles,
+      tilesMeta,
+      chunkOwnership: this.world.chunkOwnership,
+      regions: this.world.regions,
+      paused: this.world.paused,
+      tickRate: this.world.config.tickRate
+    };
     
     if (meta?.agentId && this.world.agents[meta.agentId]) {
       const fog = this.world.fog[meta.agentId];
       const tiles = fog ? filterTilesByFog(this.world, fog) : this.world.tiles;
       const units = fog ? filterUnitsByFog(this.world, fog) : this.world.units;
       return {
-        type: "snapshot",
-        protocolVersion: PROTOCOL_VERSION,
-        snapshotVersion: SNAPSHOT_VERSION,
-        worldId: this.world.worldId,
-        worldType: this.world.type,
-        seed: this.world.config.seed,
-        tick: this.world.tick,
-        serverTime: Date.now(),
-        config: this.world.config,
+        ...baseSnapshot,
         tiles,
-        chunkOwnership: this.world.chunkOwnership,
-        regions: this.world.regions,
+        tilesMeta: { ...tilesMeta, tileCount: tiles.length },
         units,
         cities: this.world.cities,
         states: this.world.states,
         events: this.world.events,
-        paused: this.world.paused,
-        tickRate: this.world.config.tickRate,
         fog,
         heatmaps: fog ? filterHeatmapsForAgent(this.world.heatmaps, fog, this.world.config.size) : this.world.heatmaps
       };
     }
     if (meta?.spectator) {
-      // Spectator mode - allow without token, but token enables full view
       return {
-        type: "snapshot",
-        protocolVersion: PROTOCOL_VERSION,
-        snapshotVersion: SNAPSHOT_VERSION,
-        worldId: this.world.worldId,
-        worldType: this.world.type,
-        seed: this.world.config.seed,
-        tick: this.world.tick,
-        serverTime: Date.now(),
-        config: this.world.config,
-        tiles: this.world.tiles, // Always include tiles for spectators
-        chunkOwnership: this.world.chunkOwnership,
-        regions: this.world.regions,
+        ...baseSnapshot,
         units: this.world.units,
         cities: this.world.cities,
         states: this.world.states,
         events: this.world.events,
-        paused: this.world.paused,
-        tickRate: this.world.config.tickRate,
         heatmaps: this.world.heatmaps,
         dramaEvents: this.world.dramaEvents.slice(0, 50),
         wars: Object.values(this.world.wars).filter((w) => !w.endTick).map((w) => ({
@@ -1343,24 +1407,11 @@ export class WorldDurableObject {
     }
     // Default case: unauthenticated spectator - still return tiles
     return {
-      type: "snapshot",
-      protocolVersion: PROTOCOL_VERSION,
-      snapshotVersion: SNAPSHOT_VERSION,
-      worldId: this.world.worldId,
-      worldType: this.world.type,
-      seed: this.world.config.seed,
-      tick: this.world.tick,
-      serverTime: Date.now(),
-      config: this.world.config,
-      tiles: this.world.tiles, // Always include tiles
-      chunkOwnership: this.world.chunkOwnership,
-      regions: this.world.regions,
+      ...baseSnapshot,
       units: {},
       cities: this.world.cities,
       states: this.world.states,
-      events: this.world.events,
-      paused: this.world.paused,
-      tickRate: this.world.config.tickRate
+      events: this.world.events
     };
   }
 
@@ -1377,15 +1428,11 @@ export class WorldDurableObject {
     }
     
     // CRITICAL: Sanity check before returning snapshot
+    // Tiles are derived data - regenerate deterministically if missing
     const expectedTileCount = this.world.config.size * this.world.config.size;
     if (!this.world.tiles || this.world.tiles.length !== expectedTileCount) {
-      console.error(`CRITICAL: World tiles missing before snapshot (${this.world.tiles?.length || 0} vs ${expectedTileCount}), regenerating...`);
-      // Regenerate tiles
-      const { generateWorldMap } = await import("./worldgen");
-      this.world.tiles = generateWorldMap(this.world.config.seed, this.world.config.size);
-      // Save tiles
-      await saveTiles(this.state.storage, this.world.config.seed, this.world.tiles);
-      await this.persistWorld();
+      console.warn(`World tiles missing or wrong size (${this.world.tiles?.length || 0} vs ${expectedTileCount}), regenerating...`);
+      this.world.tiles = getOrGenerateTiles(this.world.config.seed, this.world.config.size);
     }
     
     const url = new URL(request.url);
